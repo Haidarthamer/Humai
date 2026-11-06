@@ -11,6 +11,7 @@ plugins {
 android {
   namespace = "com.example"
   compileSdk { version = release(36) { minorApiLevel = 1 } }
+  ndkVersion = "29.0.13113456"
 
   defaultConfig {
     applicationId = "com.aistudio.companionai.xqlnw"
@@ -20,6 +21,18 @@ android {
     versionName = "1.0"
 
     testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+    ndk { abiFilters += listOf("arm64-v8a", "x86_64") }
+    externalNativeBuild {
+      cmake {
+        arguments += listOf(
+          "-DCMAKE_BUILD_TYPE=Release",
+          "-DGGML_NATIVE=OFF",
+          "-DGGML_OPENMP=OFF",
+          "-DGGML_LLAMAFILE=OFF",
+          "-DLLAMA_OPENSSL=OFF"
+        )
+      }
+    }
   }
 
   // Do not remove or modify these signingConfigs. They are necessary for building, installing,
@@ -58,6 +71,12 @@ android {
   compileOptions {
     sourceCompatibility = JavaVersion.VERSION_11
     targetCompatibility = JavaVersion.VERSION_11
+  }
+  externalNativeBuild {
+    cmake {
+      path = file("src/main/cpp/CMakeLists.txt")
+      version = "3.31.6"
+    }
   }
   buildFeatures {
     compose = true
