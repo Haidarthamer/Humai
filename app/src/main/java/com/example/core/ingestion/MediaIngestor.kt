@@ -20,7 +20,9 @@ import com.example.database.dao.MemoryDao
 import com.example.database.entities.DocumentEntity
 import com.example.database.entities.KnowledgeChunkEntity
 import com.example.database.entities.MemoryEntity
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.io.FileOutputStream
@@ -65,10 +67,12 @@ class MediaIngestor(
         val docId = documentDao.insertDocument(docEntity)
 
         val retriever = MediaMetadataRetriever()
+        var framesDir: File? = null
         try {
             retriever.setDataSource(cachedFile.absolutePath)
             val durationStr = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)
-            val durationMs = durationStr?.toLongOrNull() ?: 30_000L
+            val durationMs = durationStr?.toLongOrNull()
+                ?: throw IllegalStateException("Could not read the video's duration metadata.")
             val durationSec = (durationMs / 1000L).coerceAtLeast(1L)
 
             // Step 1: Transcribe audio using Whisper.cpp
@@ -78,8 +82,9 @@ class MediaIngestor(
 
             // Step 2: Extract keyframes and analyze with Qwen3-VL
             onProgress(0.55f, "Extracting video frames and analyzing scenes with Qwen3-VL...")
-            val framesDir = File(context.cacheDir, "video_frames_$docId").apply { mkdirs() }
-            val intervalSec = (durationSec / 4).coerceIn(5L, 60L)
+            val frameDirectory = File(context.cacheDir, "video_frames_$docId").apply { mkdirs() }
+            framesDir = frameDirectory
+            val intervalSec = kotlin.math.ceil(durationSec / 12.0).toLong().coerceAtLeast(5L)
 
             val knowledgeChunks = mutableListOf<KnowledgeChunkEntity>()
             var chunkIdx = 0
@@ -90,10 +95,14 @@ class MediaIngestor(
                 val frameBitmap = retriever.getFrameAtTime(timeMicros, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
 
                 val frameFileName = "frame_${sec}s.jpg"
-                val frameFile = File(framesDir, frameFileName)
+                val frameFile = File(frameDirectory, frameFileName)
                 if (frameBitmap != null) {
-                    FileOutputStream(frameFile).use { out ->
-                        frameBitmap.compress(Bitmap.CompressFormat.JPEG, 75, out)
+                    try {
+                        FileOutputStream(frameFile).use { out ->
+                            frameBitmap.compress(Bitmap.CompressFormat.JPEG, 75, out)
+                        }
+                    } finally {
+                        frameBitmap.recycle()
                     }
                 }
 
@@ -166,6 +175,18 @@ class MediaIngestor(
 
             onProgress(1.0f, "Video assimilation complete!")
             docId
+        } catch (cancelled: CancellationException) {
+            withContext(NonCancellable) {
+                documentDao.updateDocument(
+                    docEntity.copy(
+                        id = docId,
+                        status = IngestionStatus.CANCELLED,
+                        progress = 0f,
+                        summary = "Import cancelled."
+                    )
+                )
+            }
+            throw cancelled
         } catch (e: Exception) {
             documentDao.updateDocument(
                 docEntity.copy(id = docId, status = IngestionStatus.FAILED, summary = "Error: ${e.message}")
@@ -173,6 +194,7 @@ class MediaIngestor(
             docId
         } finally {
             try { retriever.release() } catch (_: Exception) {}
+            try { framesDir?.deleteRecursively() } catch (_: Exception) {}
         }
     }
 
@@ -201,7 +223,9 @@ class MediaIngestor(
 
         try {
             onProgress(0.6f, "Checking local image-understanding runtime...")
-            val analysis = visionEngine.analyzeImage(uri)
+            // Analyze the app-private cached copy, not a temporary picker URI whose
+            // read permission may have expired after the file was selected.
+            val analysis = visionEngine.analyzeImage(Uri.fromFile(cachedFile))
             val sceneDescription = "Qwen3-VL Visual Asset '$fileName' [${analysis.width}x${analysis.height}, ${analysis.format}]: ${analysis.sceneDescription}"
             val vector = LocalEmbeddingEngine.generateEmbedding(sceneDescription)
 
