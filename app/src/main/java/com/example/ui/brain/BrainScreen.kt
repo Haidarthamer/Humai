@@ -1,6 +1,8 @@
 package com.example.ui.brain
 
 import android.net.Uri
+import android.provider.OpenableColumns
+import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
@@ -88,13 +90,27 @@ fun BrainScreen(
         contract = ActivityResultContracts.OpenDocument()
     ) { uri: Uri? ->
         uri?.let {
-            val fileName = uri.path?.substringAfterLast('/') ?: "imported_model.gguf"
-            val destFile = File(context.filesDir, "models/$fileName")
-            destFile.parentFile?.mkdirs()
-            context.contentResolver.openInputStream(uri)?.use { inp ->
-                FileOutputStream(destFile).use { out -> inp.copyTo(out) }
+            val displayName = context.contentResolver.query(
+                uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null
+            )?.use { cursor ->
+                if (cursor.moveToFirst()) cursor.getString(0) else null
+            } ?: uri.lastPathSegment ?: "imported_model.gguf"
+            val fileName = displayName.substringAfterLast('/').substringAfterLast('\\')
+                .replace(Regex("[^a-zA-Z0-9._-]"), "_")
+            val destFile = File(context.filesDir, "models/${System.currentTimeMillis()}_${fileName}")
+            try {
+                destFile.parentFile?.mkdirs()
+                val input = context.contentResolver.openInputStream(uri)
+                    ?: throw IllegalArgumentException("Cannot open selected file.")
+                input.use { inp ->
+                    FileOutputStream(destFile).use { out -> inp.copyTo(out) }
+                }
+                viewModel.modelManager.registerImportedModel(destFile)
+                Toast.makeText(context, "Model imported and validated.", Toast.LENGTH_SHORT).show()
+            } catch (error: Exception) {
+                destFile.delete()
+                Toast.makeText(context, "Import failed: ${error.message}", Toast.LENGTH_LONG).show()
             }
-            viewModel.modelManager.registerImportedModel(destFile)
         }
     }
 
@@ -149,7 +165,7 @@ fun BrainScreen(
                             .padding(horizontal = 8.dp, vertical = 3.dp)
                     ) {
                         Text(
-                            text = if (isNativeLoaded) "JNI LLAMA ACTIVE" else "EMBEDDED NEURAL",
+                            text = if (isNativeLoaded) "NATIVE RUNTIME READY" else "CMAKE BUILD REQUIRED",
                             color = if (isNativeLoaded) CompanionSuccess else CompanionCyanBright,
                             fontSize = 10.sp,
                             fontWeight = FontWeight.Bold
@@ -201,8 +217,8 @@ fun BrainScreen(
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         Text(
-                            text = if (provProgress.error != null) "Installation Error" else "Installing Bundled Offline Models",
-                            color = if (provProgress.error != null) Color(0xFFFF5252) else CompanionCyanBright,
+                            text = if (provProgress.error != null) "Model Weights Not Bundled" else "Preparing Local Models",
+                            color = if (provProgress.error != null) CompanionCyanBright else CompanionCyanBright,
                             fontSize = 13.sp,
                             fontWeight = FontWeight.Bold
                         )
@@ -215,7 +231,7 @@ fun BrainScreen(
                     }
                     Spacer(modifier = Modifier.height(6.dp))
                     androidx.compose.material3.LinearProgressIndicator(
-                        progress = { provProgress.progress },
+                        progress = { if (provProgress.isInstalling) provProgress.progress else 0f },
                         modifier = Modifier
                             .fillMaxWidth()
                             .height(6.dp)
@@ -232,10 +248,10 @@ fun BrainScreen(
                     if (provProgress.error != null) {
                         Spacer(modifier = Modifier.height(8.dp))
                         Button(
-                            onClick = { viewModel.retryModelProvisioning() },
+                            onClick = { customModelPicker.launch(arrayOf("*/*")) },
                             colors = ButtonDefaults.buttonColors(containerColor = CompanionCyanDark)
                         ) {
-                            Text("Retry Installation", color = CompanionCyanBright, fontSize = 11.sp)
+                            Text(if (isArabic) "استيراد موديل GGUF" else "Import a GGUF model", color = CompanionCyanBright, fontSize = 11.sp)
                         }
                     }
                 }
@@ -253,23 +269,15 @@ fun BrainScreen(
             Column {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Text(
-                        text = if (isArabic) "النماذج المثبتة مسبقاً (Pre-Installed Models):" else "Pre-Installed AI Models (Offline):",
+                        text = if (isArabic) "كتالوج النماذج المحلية" else "Local Model Catalog",
                         color = CompanionCyanBright,
                         fontSize = 13.sp,
                         fontWeight = FontWeight.Bold
                     )
-                    Spacer(modifier = Modifier.width(6.dp))
-                    Box(
-                        modifier = Modifier
-                            .clip(RoundedCornerShape(4.dp))
-                            .background(CompanionSuccess.copy(alpha = 0.2f))
-                            .padding(horizontal = 6.dp, vertical = 2.dp)
-                    ) {
-                        Text("BUNDLED", color = CompanionSuccess, fontSize = 9.sp, fontWeight = FontWeight.Bold)
-                    }
+
                 }
                 Text(
-                    text = "Qwen3-4B Text + Qwen3-VL Vision + mmproj projector",
+                    text = if (isArabic) "ملفات النماذج مو مرفقة بالتطبيق؛ استورد ملف GGUF حقيقي من جهازك." else "Model weights are not bundled. Import a genuine GGUF file from your device.",
                     color = CompanionTextSecondary,
                     fontSize = 11.sp
                 )
@@ -358,7 +366,7 @@ fun BrainScreen(
                             Row(verticalAlignment = Alignment.CenterVertically) {
                                 val statusText = if (model.isInstalled) {
                                     if (model.integrityVerified) "Installed & Verified (GGUF v3)" else "Installed"
-                                } else "Preparing..."
+                                } else "Not imported"
                                 Text(
                                     text = "Status: $statusText • ${model.compatibility}",
                                     color = if (model.integrityVerified) CompanionSuccess else CompanionCyanBright,
@@ -398,7 +406,7 @@ fun BrainScreen(
         if (optionalModels.isNotEmpty()) {
             Spacer(modifier = Modifier.height(14.dp))
             Text(
-                text = if (isArabic) "نماذج إضافية واختيارية (Optional Models):" else "Optional Models (Download / Import on demand):",
+                text = if (isArabic) "النماذج المحلية المتاحة للاستيراد" else "Available Local Models (Manual Import)",
                 color = CompanionCyanBright,
                 fontSize = 13.sp,
                 fontWeight = FontWeight.Bold
@@ -536,11 +544,12 @@ fun BrainScreen(
                 ) {
                     Column {
                         Text(text = "GPU / NPU Acceleration", color = CompanionTextPrimary, fontSize = 12.sp, fontWeight = FontWeight.Bold)
-                        Text(text = "Offload layers to mobile GPU (Vulkan / OpenCL)", color = CompanionTextSecondary, fontSize = 10.sp)
+                        Text(text = "Unavailable in this CPU-only build", color = CompanionTextSecondary, fontSize = 10.sp)
                     }
                     Switch(
-                        checked = gpuEnabled,
-                        onCheckedChange = { viewModel.modelManager.setGpuAcceleration(it) },
+                        checked = false,
+                        onCheckedChange = { },
+                        enabled = false,
                         colors = SwitchDefaults.colors(
                             checkedThumbColor = CompanionCyan,
                             checkedTrackColor = CompanionCyanDark
