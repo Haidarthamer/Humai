@@ -93,42 +93,44 @@ class WhisperAudioEngine(private val context: Context) {
                     break
                 }
             }
-            require(track >= 0 && format != null) { "No supported audio track was found." }
+            val selectedFormat = format ?: throw IllegalArgumentException("No supported audio track was found.")
+            require(track >= 0) { "No supported audio track was found." }
             extractor.selectTrack(track)
-            val mime = format.getString(MediaFormat.KEY_MIME)
+            val mime = selectedFormat.getString(MediaFormat.KEY_MIME)
                 ?: throw IllegalArgumentException("Audio codec MIME type is missing.")
-            decoder = MediaCodec.createDecoderByType(mime)
-            decoder.configure(format, null, null, 0)
-            decoder.start()
+            val codec = MediaCodec.createDecoderByType(mime)
+            decoder = codec
+            codec.configure(selectedFormat, null, null, 0)
+            codec.start()
 
             val info = MediaCodec.BufferInfo()
-            val mono = ArrayList<Float>(TARGET_RATE * 30)
+            val mono = FloatAccumulator(TARGET_RATE * 30)
             var inputEnded = false
             var outputEnded = false
-            var sampleRate = format.getInteger(MediaFormat.KEY_SAMPLE_RATE)
-            var channels = format.getInteger(MediaFormat.KEY_CHANNEL_COUNT)
+            var sampleRate = selectedFormat.getInteger(MediaFormat.KEY_SAMPLE_RATE)
+            var channels = selectedFormat.getInteger(MediaFormat.KEY_CHANNEL_COUNT)
             var pcmEncoding = AudioFormat.ENCODING_PCM_16BIT
 
             while (!outputEnded) {
                 if (!inputEnded) {
-                    val inputIndex = decoder.dequeueInputBuffer(10_000)
+                    val inputIndex = codec.dequeueInputBuffer(10_000)
                     if (inputIndex >= 0) {
-                        val inputBuffer = decoder.getInputBuffer(inputIndex)
+                        val inputBuffer = codec.getInputBuffer(inputIndex)
                             ?: throw IllegalStateException("Decoder input buffer unavailable.")
                         val size = extractor.readSampleData(inputBuffer, 0)
                         if (size < 0) {
-                            decoder.queueInputBuffer(inputIndex, 0, 0, 0L, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
+                            codec.queueInputBuffer(inputIndex, 0, 0, 0L, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
                             inputEnded = true
                         } else {
-                            decoder.queueInputBuffer(inputIndex, 0, size, extractor.sampleTime, 0)
+                            codec.queueInputBuffer(inputIndex, 0, size, extractor.sampleTime, 0)
                             extractor.advance()
                         }
                     }
                 }
 
-                when (val outputIndex = decoder.dequeueOutputBuffer(info, 10_000)) {
+                when (val outputIndex = codec.dequeueOutputBuffer(info, 10_000)) {
                     MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
-                        val outputFormat = decoder.outputFormat
+                        val outputFormat = codec.outputFormat
                         sampleRate = outputFormat.getInteger(MediaFormat.KEY_SAMPLE_RATE)
                         channels = outputFormat.getInteger(MediaFormat.KEY_CHANNEL_COUNT)
                         if (outputFormat.containsKey(MediaFormat.KEY_PCM_ENCODING)) {
@@ -137,7 +139,7 @@ class WhisperAudioEngine(private val context: Context) {
                     }
                     MediaCodec.INFO_TRY_AGAIN_LATER -> Unit
                     else -> if (outputIndex >= 0) {
-                        val output = decoder.getOutputBuffer(outputIndex)
+                        val output = codec.getOutputBuffer(outputIndex)
                         if (output != null && info.size > 0) {
                             val buffer = output.duplicate().apply {
                                 position(info.offset)
@@ -148,9 +150,12 @@ class WhisperAudioEngine(private val context: Context) {
                             appendDownmixedSamples(mono, bytes, channels, pcmEncoding)
                         }
                         outputEnded = (info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0
-                        decoder.releaseOutputBuffer(outputIndex, false)
+                        codec.releaseOutputBuffer(outputIndex, false)
                     }
                 }
+            }
+            require(mono.size <= TARGET_RATE * 60 * 15) {
+                "Audio is longer than the 15-minute local transcription limit."
             }
             return resample(mono.toFloatArray(), sampleRate, TARGET_RATE)
         } finally {
@@ -161,7 +166,7 @@ class WhisperAudioEngine(private val context: Context) {
     }
 
     private fun appendDownmixedSamples(
-        output: MutableList<Float>,
+        output: FloatAccumulator,
         bytes: ByteArray,
         channels: Int,
         encoding: Int
@@ -193,6 +198,19 @@ class WhisperAudioEngine(private val context: Context) {
             output.add(sum / channels.coerceAtLeast(1))
             offset += frameBytes
         }
+    }
+
+    private class FloatAccumulator(initialCapacity: Int) {
+        private var values = FloatArray(initialCapacity.coerceAtLeast(1024))
+        var size: Int = 0
+            private set
+
+        fun add(value: Float) {
+            if (size == values.size) values = values.copyOf(values.size * 2)
+            values[size++] = value
+        }
+
+        fun toFloatArray(): FloatArray = values.copyOf(size)
     }
 
     private fun resample(input: FloatArray, sourceRate: Int, targetRate: Int): FloatArray {
