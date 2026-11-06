@@ -61,7 +61,7 @@ class ModelManager(private val context: Context) {
     private val _contextWindow = MutableStateFlow(4096) // Default 4096 for Snapdragon 8 Gen 3
     val contextWindow: StateFlow<Int> = _contextWindow.asStateFlow()
 
-    private val _gpuAcceleration = MutableStateFlow(true) // Enabled by default for Adreno 750
+    private val _gpuAcceleration = MutableStateFlow(false) // CPU-only llama.cpp build; Vulkan is not linked
 
     val gpuAcceleration: StateFlow<Boolean> = _gpuAcceleration.asStateFlow()
 
@@ -101,7 +101,7 @@ class ModelManager(private val context: Context) {
             supportedAbi = abis,
             recommendedModelId = DEFAULT_MODEL_ID,
             recommendedThreads = 6, // 6 worker threads for optimal throughput & thermal control
-            gpuOffloadLayers = 28   // 28 layers offloaded to Adreno 750 Vulkan
+            gpuOffloadLayers = 0    // No GPU backend is linked in this build
         )
     }
 
@@ -217,7 +217,7 @@ class ModelManager(private val context: Context) {
         if (file.exists()) {
             val result = llamaBridge.loadModel(
                 modelFile = file,
-                nGpuLayers = if (_gpuAcceleration.value) 28 else 0,
+                nGpuLayers = 0,
                 contextSize = _contextWindow.value,
                 nThreads = 6
             )
@@ -244,7 +244,8 @@ class ModelManager(private val context: Context) {
     }
 
     fun setGpuAcceleration(enabled: Boolean) {
-        _gpuAcceleration.value = enabled
+        // Prevent the UI from claiming GPU offload before a Vulkan backend is built.
+        _gpuAcceleration.value = false
     }
 
     private fun isUsableModelFile(file: File, minimumBytes: Long): Boolean {
