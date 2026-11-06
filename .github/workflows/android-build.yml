@@ -31,6 +31,19 @@ jobs:
         with:
           packages: 'platform-tools platforms;android-36 cmake;3.31.6 ndk;29.0.13113456'
 
+      - name: Create CI-only debug keystore
+        run: |
+          keytool -genkeypair -v \
+            -keystore debug.keystore \
+            -storepass android \
+            -alias androiddebugkey \
+            -keypass android \
+            -keyalg RSA \
+            -keysize 2048 \
+            -validity 10000 \
+            -dname "CN=Android Debug,O=Android,C=US"
+
+      - name: Set up Gradle
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
         with:
