@@ -67,7 +67,12 @@ class DocumentIngestor(
             val pagesData: List<Pair<Int, String>> = when (fileType) {
                 FileType.PDF -> {
                     val pages = pdfHelper.extractTextByPages(cachedFile)
-                    if (pages.isEmpty()) listOf(Pair(1, "Empty or image-only PDF")) else pages
+                    if (pages.none { it.second.isNotBlank() }) {
+                        throw IllegalStateException(
+                            "This PDF has no selectable text. It may be scanned/image-only; offline OCR is not integrated yet."
+                        )
+                    }
+                    pages
                 }
                 FileType.DOCX -> {
                     val text = extractDocxText(cachedFile)
