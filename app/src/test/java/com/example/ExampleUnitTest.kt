@@ -2,225 +2,139 @@ package com.example
 
 import com.example.core.ai.GGUFParser
 import com.example.core.ai.LocalEmbeddingEngine
-import com.example.core.ai.QwenResponseGenerator
+import com.example.core.ai.PreinstalledModelProvisioner
 import com.example.core.ai.QwenTokenizer
+import com.example.core.ai.TextStreamHelper
 import org.junit.Assert.assertEquals
-import org.junit.Assert.assertNotEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import java.io.ByteArrayOutputStream
+import java.io.DataOutputStream
 import java.io.File
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
 
 class ExampleUnitTest {
+
     @Test
     fun addition_isCorrect() {
         assertEquals(4, 2 + 2)
     }
 
     @Test
-    fun testArabicNormalizationAndTokenization() {
+    fun testArabicNormalizationAndLexicalTokenization() {
         val original = "الْحَوْسَبَةُ الْكَمُّومِيَّةُ"
         val normalized = LocalEmbeddingEngine.normalizeArabic(original)
-        assertTrue(!normalized.contains("\u064E"))
-        val tokens = LocalEmbeddingEngine.tokenize(original)
-        assertTrue(tokens.isNotEmpty())
+        assertFalse(normalized.contains("\u064E"))
+        assertTrue(LocalEmbeddingEngine.tokenize(original).isNotEmpty())
     }
 
     @Test
-    fun testSemanticEmbeddingAndCosineSimilarity() {
-        val v1 = LocalEmbeddingEngine.generateEmbedding("quantum computing superposition qubits")
-        val simSelf = LocalEmbeddingEngine.cosineSimilarity(v1, v1)
-        val v2 = LocalEmbeddingEngine.generateEmbedding("quantum computing superposition qubits")
-        val simIdentical = LocalEmbeddingEngine.cosineSimilarity(v1, v2)
-
-        assertEquals(1.0f, simSelf, 0.001f)
-        assertEquals(1.0f, simIdentical, 0.001f)
+    fun testLexicalFingerprintIsDeterministic() {
+        val first = LocalEmbeddingEngine.generateEmbedding("local offline model")
+        val second = LocalEmbeddingEngine.generateEmbedding("local offline model")
+        assertEquals(1.0f, LocalEmbeddingEngine.cosineSimilarity(first, second), 0.001f)
     }
 
     @Test
-    fun testQwenChatMLFormatting() {
+    fun testChatMLFormatting() {
         val chatML = QwenTokenizer.formatChatML(
-            systemPrompt = "You are Qwen3-4B.",
+            systemPrompt = "You are a local assistant.",
             recentHistory = listOf(true to "Hello", false to "Hi!"),
-            userMessage = "Explain quantum superposition",
-            relevantMemories = listOf("User studies quantum mechanics"),
-            citations = listOf("Physics_Notes.pdf (Page 2): Superposition formula")
+            userMessage = "Explain this document",
+            relevantMemories = listOf("A saved note"),
+            citations = listOf("Physics_Notes.pdf (Page 2): Source excerpt")
         )
 
         assertTrue(chatML.contains("<|im_start|>system"))
-        assertTrue(chatML.contains("You are Qwen3-4B."))
+        assertTrue(chatML.contains("A saved note"))
+        assertTrue(chatML.contains("Physics_Notes.pdf (Page 2)"))
         assertTrue(chatML.contains("<|im_start|>user"))
-        assertTrue(chatML.contains("Explain quantum superposition"))
-        assertTrue(chatML.contains("<|im_start|>assistant"))
+        assertTrue(chatML.contains("Explain this document"))
+        assertTrue(chatML.endsWith("<|im_start|>assistant\n"))
     }
 
     @Test
-    fun testQwenResponseGenerationNeverReturnsAcknowledged() {
-        val chatML = QwenTokenizer.formatChatML(
-            systemPrompt = "You are Qwen3-4B.",
-            recentHistory = emptyList(),
-            userMessage = "What is the capital of France?",
-            relevantMemories = emptyList(),
-            citations = emptyList()
-        )
-
-        val response = QwenResponseGenerator.generate(chatML, null)
-
-        assertNotEquals("Acknowledged.", response.trim())
-        assertNotEquals("Acknowledged", response.trim())
-        assertTrue(response.isNotBlank())
-        assertTrue(response.contains("Qwen3-4B") || response.length > 20)
+    fun testGGUFParserRejectsNonexistentFile() {
+        val result = GGUFParser.parse(File("/tmp/non_existent_model.gguf"))
+        assertFalse(result.isValid)
     }
 
     @Test
-    fun testQwenIraqiArabicResponse() {
-        val chatML = QwenTokenizer.formatChatML(
-            systemPrompt = "You are Qwen3-4B. Language Mode: Iraqi Arabic.",
-            recentHistory = emptyList(),
-            userMessage = "شلونك اليوم؟",
-            relevantMemories = emptyList(),
-            citations = emptyList()
-        )
+    fun testGGUFParserSkipsStringArraysAndFindsMetadataAfterThem() {
+        val file = File.createTempFile("humai-gguf-test", ".gguf")
+        try {
+            val bytes = ByteArrayOutputStream()
+            val out = DataOutputStream(bytes)
 
-        val response = QwenResponseGenerator.generate(chatML, null)
-        assertTrue(response.isNotBlank())
-        assertNotEquals("Acknowledged.", response)
-    }
+            out.write(byteArrayOf(0x47, 0x47, 0x55, 0x46)) // GGUF
+            writeIntLE(out, 3) // version
+            writeLongLE(out, 1L) // one tensor
+            writeLongLE(out, 3L) // three metadata entries
 
-    @Test
-    fun testQwenVisionPromptGeneration() {
-        val chatML = QwenTokenizer.formatChatML(
-            systemPrompt = "You are Qwen3-VL.",
-            recentHistory = emptyList(),
-            userMessage = "What is shown in this chart?",
-            relevantMemories = emptyList(),
-            citations = emptyList(),
-            imagePrompt = "Bar chart showing annual GDP growth from 2020 to 2025"
-        )
+            writeMetadataString(out, "general.architecture", "qwen3")
 
-        assertTrue(chatML.contains("<|vision_start|>"))
-        assertTrue(chatML.contains("<|image_pad|>"))
+            writeString(out, "tokenizer.ggml.tokens")
+            writeIntLE(out, 9) // ARRAY
+            writeIntLE(out, 8) // STRING element type
+            writeLongLE(out, 2L)
+            writeString(out, "hello")
+            writeString(out, "world")
 
-        val response = QwenResponseGenerator.generate(chatML, null)
-        assertTrue(response.contains("Qwen3-VL") || response.contains("Visual"))
-        assertNotEquals("Acknowledged.", response)
-    }
+            writeMetadataString(out, "general.name", "Humai parser fixture")
 
-    @Test
-    fun testGGUFParserNonExistentFile() {
-        val fakeFile = File("/tmp/non_existent_model.gguf")
-        val meta = GGUFParser.parse(fakeFile)
-        assertTrue(!meta.isValid)
-    }
+            file.writeBytes(bytes.toByteArray())
+            val parsed = GGUFParser.parse(file)
 
-    @Test
-    fun testPreinstalledModelSpecsConfiguration() {
-        val specs = com.example.core.ai.PreinstalledModelProvisioner.BUNDLED_MODELS
-        assertEquals(3, specs.size)
-
-        val defaultModel = specs.find { it.isDefault }
-        assertTrue(defaultModel != null)
-        assertEquals("qwen3-4b-instruct-q4_k_m.gguf", defaultModel?.fileName)
-
-        val visionModel = specs.find { it.fileName == "qwen3-vl-4b-instruct-q4_k_m.gguf" }
-        assertTrue(visionModel != null)
-
-        val projectorModel = specs.find { it.fileName == "mmproj-qwen3-vl-4b-f16.gguf" }
-        assertTrue(projectorModel != null)
-    }
-
-    @Test
-    fun testBundledGGUFHeaderValidation() {
-        val assetsDir = File("src/main/assets/models")
-        if (assetsDir.exists()) {
-            val qwen3File = File(assetsDir, "qwen3-4b-instruct-q4_k_m.gguf")
-            if (qwen3File.exists()) {
-                val meta = GGUFParser.parse(qwen3File)
-                assertTrue("Qwen3-4B GGUF header must be valid", meta.isValid)
-                assertEquals("qwen3", meta.architecture)
-                assertEquals("Q4_K_M", meta.quantization)
-            }
-
-            val qwen3VlFile = File(assetsDir, "qwen3-vl-4b-instruct-q4_k_m.gguf")
-            if (qwen3VlFile.exists()) {
-                val meta = GGUFParser.parse(qwen3VlFile)
-                assertTrue("Qwen3-VL GGUF header must be valid", meta.isValid)
-                assertEquals("qwen3-vl", meta.architecture)
-                assertEquals("Q4_K_M", meta.quantization)
-            }
-
-            val mmprojFile = File(assetsDir, "mmproj-qwen3-vl-4b-f16.gguf")
-            if (mmprojFile.exists()) {
-                val meta = GGUFParser.parse(mmprojFile)
-                assertTrue("mmproj GGUF header must be valid", meta.isValid)
-                assertEquals("clip", meta.architecture)
-                assertEquals("F16", meta.quantization)
-            }
+            assertTrue(parsed.errorMessage ?: "Expected valid GGUF metadata", parsed.isValid)
+            assertEquals("qwen3", parsed.architecture)
+            assertEquals("Humai parser fixture", parsed.modelName)
+            assertEquals(1L, parsed.tensorCount)
+            assertEquals(3L, parsed.metadataKvCount)
+        } finally {
+            file.delete()
         }
     }
 
     @Test
-    fun testTextStreamHelperSplitting() {
-        val englishText = "Hello, world! How are you doing today? I am fine."
-        val pieces = com.example.core.ai.TextStreamHelper.splitIntoStreamPieces(englishText)
-        assertTrue(pieces.isNotEmpty())
-        assertEquals(englishText, pieces.joinToString(""))
-
-        val arabicText = "مرحبا، شلونك؟ هذا نموذج محلي؛ يعمل 100% بدون إنترنت."
-        val arabicPieces = com.example.core.ai.TextStreamHelper.splitIntoStreamPieces(arabicText)
-        assertTrue(arabicPieces.isNotEmpty())
-        assertEquals(arabicText, arabicPieces.joinToString(""))
-
-        val mixedText = "Qwen3-4B is ready! مرحبا بك، النظام يعمل أوفلاين."
-        val mixedPieces = com.example.core.ai.TextStreamHelper.splitIntoStreamPieces(mixedText)
-        assertEquals(mixedText, mixedPieces.joinToString(""))
-
-        val multilineText = "Line 1.\nLine 2!\nLine 3؟\nLine 4."
-        val multilinePieces = com.example.core.ai.TextStreamHelper.splitIntoStreamPieces(multilineText)
-        assertEquals(multilineText, multilinePieces.joinToString(""))
-
-        val emptyPieces = com.example.core.ai.TextStreamHelper.splitIntoStreamPieces("")
-        assertTrue(emptyPieces.isEmpty())
+    fun testNoModelWeightsAreClaimedAsBundled() {
+        assertTrue(PreinstalledModelProvisioner.BUNDLED_MODELS.isEmpty())
     }
 
     @Test
-    fun testTextStreamHelperSentenceSplitting() {
-        val mixedDoc = "First point. Second point! هل تفهم العربية؟ نعم، بالتأكيد؛ تم التوثيق."
-        val sentences = com.example.core.ai.TextStreamHelper.splitIntoSentences(mixedDoc)
-        assertTrue(sentences.size >= 4)
-        assertTrue(sentences.any { it.contains("First point") })
-        assertTrue(sentences.any { it.contains("العربية") })
-    }
-
-    @Test
-    fun testQwenGeneratesGenuineResponseForHi() {
-        val chatML = com.example.core.ai.QwenTokenizer.formatChatML(
-            systemPrompt = "You are Qwen3-4B.",
-            recentHistory = emptyList(),
-            userMessage = "hi",
-            relevantMemories = emptyList(),
-            citations = emptyList()
+    fun testTextStreamHelperPreservesMixedLanguageText() {
+        val samples = listOf(
+            "Hello, world! How are you doing today?",
+            "مرحبا، شلونك؟ هذا نموذج محلي؛ يعمل 100% بدون إنترنت.",
+            "Qwen3 model ready! مرحبا بك، النظام يعمل أوفلاين.",
+            "Line 1.\nLine 2!\nLine 3؟"
         )
 
-        val response = com.example.core.ai.QwenResponseGenerator.generate(chatML, null)
-        assertTrue(response.isNotBlank())
-        assertNotEquals("Acknowledged.", response.trim())
-        assertNotEquals("Acknowledged", response.trim())
-        assertTrue(response.contains("COMPANION AI") || response.contains("Qwen3-4B") || response.contains("help"))
+        samples.forEach { sample ->
+            val pieces = TextStreamHelper.splitIntoStreamPieces(sample)
+            assertEquals(sample, pieces.joinToString(""))
+        }
+        assertTrue(TextStreamHelper.splitIntoStreamPieces("").isEmpty())
     }
 
-    @Test
-    fun testQwenGeneratesGenuineResponseForIraqiArabicQuery() {
-        val chatML = com.example.core.ai.QwenTokenizer.formatChatML(
-            systemPrompt = "You are COMPANION AI. Language Mode: Iraqi Arabic.",
-            recentHistory = emptyList(),
-            userMessage = "شلونك؟ شنو تكدر تسوي؟",
-            relevantMemories = emptyList(),
-            citations = emptyList()
-        )
+    private fun writeMetadataString(out: DataOutputStream, key: String, value: String) {
+        writeString(out, key)
+        writeIntLE(out, 8) // STRING
+        writeString(out, value)
+    }
 
-        val response = com.example.core.ai.QwenResponseGenerator.generate(chatML, null)
-        assertTrue(response.isNotBlank())
-        assertNotEquals("Acknowledged.", response.trim())
-        assertTrue(response.contains("Qwen3-4B") || response.contains("PDF") || response.contains("الصور") || response.contains("أكدر") || response.contains("تمام"))
+    private fun writeString(out: DataOutputStream, value: String) {
+        val bytes = value.toByteArray(Charsets.UTF_8)
+        writeLongLE(out, bytes.size.toLong())
+        out.write(bytes)
+    }
+
+    private fun writeIntLE(out: DataOutputStream, value: Int) {
+        out.write(ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN).putInt(value).array())
+    }
+
+    private fun writeLongLE(out: DataOutputStream, value: Long) {
+        out.write(ByteBuffer.allocate(8).order(ByteOrder.LITTLE_ENDIAN).putLong(value).array())
     }
 }
