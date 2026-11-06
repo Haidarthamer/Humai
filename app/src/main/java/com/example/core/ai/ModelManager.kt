@@ -87,7 +87,7 @@ class ModelManager(private val context: Context) {
         val abis = Build.SUPPORTED_ABIS.firstOrNull() ?: "arm64-v8a"
 
         val deviceName = "${Build.MANUFACTURER.capitalize()} ${Build.MODEL}"
-        val isSnapdragon8Gen3 = totalRamMb >= 11000 || Build.HARDWARE.contains("qcom") || Build.SOC_MODEL.contains("8650")
+        val isSnapdragon8Gen3 = Build.VERSION.SDK_INT >= 31 && Build.SOC_MODEL.contains("8650", ignoreCase = true)
 
         return HardwareReport(
             deviceName = if (isSnapdragon8Gen3) "$deviceName (Snapdragon 8 Gen 3 / 12GB)" else deviceName,
@@ -114,9 +114,11 @@ class ModelManager(private val context: Context) {
         val qwen25File = File(modelsDir, "qwen-2.5-1.5b.gguf")
         val llama32File = File(modelsDir, "llama-3.2-1b.gguf")
 
-        val qwen3Valid = qwen3File.exists() && GGUFParser.parse(qwen3File).isValid
-        val qwen3VlValid = qwen3VlFile.exists() && GGUFParser.parse(qwen3VlFile).isValid
-        val mmprojValid = mmprojFile.exists() && GGUFParser.parse(mmprojFile).isValid
+        val qwen3Valid = isUsableModelFile(qwen3File, 100L * 1024L * 1024L)
+        val qwen3VlValid = isUsableModelFile(qwen3VlFile, 100L * 1024L * 1024L)
+        val mmprojValid = isUsableModelFile(mmprojFile, 50L * 1024L * 1024L)
+        val qwen25Valid = isUsableModelFile(qwen25File, 25L * 1024L * 1024L)
+        val llama32Valid = isUsableModelFile(llama32File, 25L * 1024L * 1024L)
 
         val predefined = listOf(
             GGUFModelInfo(
@@ -125,13 +127,13 @@ class ModelManager(private val context: Context) {
                 architecture = "Qwen 3 (Dense)",
                 parameterCount = "4.0B",
                 quantization = "Q4_K_M",
-                fileSizeBytes = if (qwen3File.exists()) qwen3File.length() else 2_480_000_000L,
-                isInstalled = qwen3File.exists(),
+                fileSizeBytes = if (qwen3File.isFile) qwen3File.length() else 0L,
+                isInstalled = qwen3Valid,
                 isLoaded = _activeModel.value?.id == "qwen3-4b" && llamaBridge.isModelLoaded,
                 localFilePath = qwen3File.absolutePath,
-                isPreinstalled = true,
+                isPreinstalled = false,
                 modelRole = com.example.core.model.ModelRole.TEXT_DEFAULT,
-                compatibility = "Snapdragon 8 Gen 3 & 12GB RAM (Hardware Verified)",
+                compatibility = "Requires a real GGUF file and a working native runtime; not hardware-verified",
                 integrityVerified = qwen3Valid
             ),
             GGUFModelInfo(
@@ -140,13 +142,13 @@ class ModelManager(private val context: Context) {
                 architecture = "Qwen 3 Vision-Language",
                 parameterCount = "4.2B",
                 quantization = "Q4_K_M",
-                fileSizeBytes = if (qwen3VlFile.exists()) qwen3VlFile.length() else 2_520_000_000L,
-                isInstalled = qwen3VlFile.exists(),
+                fileSizeBytes = if (qwen3VlFile.isFile) qwen3VlFile.length() else 0L,
+                isInstalled = qwen3VlValid,
                 isLoaded = _activeModel.value?.id == "qwen3-vl-4b" && llamaBridge.isModelLoaded,
                 localFilePath = qwen3VlFile.absolutePath,
-                isPreinstalled = true,
+                isPreinstalled = false,
                 modelRole = com.example.core.model.ModelRole.VISION_MULTIMODAL,
-                compatibility = "Snapdragon 8 Gen 3 & 12GB RAM (Hardware Verified)",
+                compatibility = "Requires compatible vision GGUF files and a multimodal native runtime; not verified",
                 integrityVerified = qwen3VlValid
             ),
             GGUFModelInfo(
@@ -155,13 +157,13 @@ class ModelManager(private val context: Context) {
                 architecture = "CLIP Vision Projector (mmproj)",
                 parameterCount = "Vision Adapter",
                 quantization = "F16",
-                fileSizeBytes = if (mmprojFile.exists()) mmprojFile.length() else 640_000_000L,
-                isInstalled = mmprojFile.exists(),
-                isLoaded = qwen3VlFile.exists() && mmprojFile.exists(),
+                fileSizeBytes = if (mmprojFile.isFile) mmprojFile.length() else 0L,
+                isInstalled = mmprojValid,
+                isLoaded = false,
                 localFilePath = mmprojFile.absolutePath,
-                isPreinstalled = true,
+                isPreinstalled = false,
                 modelRole = com.example.core.model.ModelRole.VISION_PROJECTOR,
-                compatibility = "Snapdragon 8 Gen 3 & 12GB RAM (Hardware Verified)",
+                compatibility = "Requires a compatible multimodal native runtime; not verified",
                 integrityVerified = mmprojValid
             ),
             GGUFModelInfo(
@@ -170,14 +172,14 @@ class ModelManager(private val context: Context) {
                 architecture = "Qwen 2.5",
                 parameterCount = "1.5B",
                 quantization = "Q4_K_M",
-                fileSizeBytes = if (qwen25File.exists()) qwen25File.length() else 986_000_000L,
-                isInstalled = qwen25File.exists(),
+                fileSizeBytes = if (qwen25File.isFile) qwen25File.length() else 0L,
+                isInstalled = qwen25Valid,
                 isLoaded = _activeModel.value?.id == "qwen-2.5-1.5b" && llamaBridge.isModelLoaded,
                 localFilePath = qwen25File.absolutePath,
                 isPreinstalled = false,
                 modelRole = com.example.core.model.ModelRole.OPTIONAL_TEXT,
                 compatibility = "Low RAM / Mid-Tier Fallback",
-                integrityVerified = qwen25File.exists() && GGUFParser.parse(qwen25File).isValid
+                integrityVerified = qwen25Valid
             ),
             GGUFModelInfo(
                 id = "llama-3.2-1b",
@@ -185,14 +187,14 @@ class ModelManager(private val context: Context) {
                 architecture = "Llama 3.2",
                 parameterCount = "1.2B",
                 quantization = "Q4_K_M",
-                fileSizeBytes = if (llama32File.exists()) llama32File.length() else 745_000_000L,
-                isInstalled = llama32File.exists(),
+                fileSizeBytes = if (llama32File.isFile) llama32File.length() else 0L,
+                isInstalled = llama32Valid,
                 isLoaded = _activeModel.value?.id == "llama-3.2-1b" && llamaBridge.isModelLoaded,
                 localFilePath = llama32File.absolutePath,
                 isPreinstalled = false,
                 modelRole = com.example.core.model.ModelRole.OPTIONAL_TEXT,
                 compatibility = "Low RAM / Mid-Tier Fallback",
-                integrityVerified = llama32File.exists() && GGUFParser.parse(llama32File).isValid
+                integrityVerified = llama32Valid
             )
         )
 
@@ -245,8 +247,18 @@ class ModelManager(private val context: Context) {
         _gpuAcceleration.value = enabled
     }
 
+    private fun isUsableModelFile(file: File, minimumBytes: Long): Boolean {
+        if (!file.isFile || !file.canRead() || file.length() < minimumBytes) return false
+        return GGUFParser.parse(file).isValid
+    }
+
     fun registerImportedModel(file: File): GGUFModelInfo {
+        require(file.isFile && file.canRead()) { "Selected model file is missing or unreadable." }
+        require(file.length() >= 1L * 1024L * 1024L) {
+            "Selected file is too small to be a real model. The repository's bundled 1.2 KB files are placeholders, not GGUF weights."
+        }
         val meta = GGUFParser.parse(file)
+        require(meta.isValid) { "Selected file is not a valid GGUF model: ${meta.errorMessage}" }
         val model = GGUFModelInfo(
             id = "custom-${file.nameWithoutExtension}",
             name = if (meta.isValid) meta.modelName else file.name,
@@ -255,7 +267,7 @@ class ModelManager(private val context: Context) {
             quantization = if (meta.isValid) meta.quantization else "GGUF",
             fileSizeBytes = file.length(),
             isInstalled = true,
-            isLoaded = true,
+            isLoaded = false,
             localFilePath = file.absolutePath
         )
         _activeModel.value = model
