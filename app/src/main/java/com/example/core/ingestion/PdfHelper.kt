@@ -3,151 +3,145 @@ package com.example.core.ingestion
 import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.Color
-import android.graphics.Matrix
-import android.graphics.Rect
 import android.graphics.pdf.PdfRenderer
 import android.net.Uri
 import android.os.ParcelFileDescriptor
 import android.util.Log
+import com.tom_roush.pdfbox.android.PDFBoxResourceLoader
+import com.tom_roush.pdfbox.pdmodel.PDDocument
+import com.tom_roush.pdfbox.text.PDFTextStripper
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.io.FileOutputStream
+import java.util.UUID
 
 class PdfHelper(private val context: Context) {
 
     private var fileDescriptor: ParcelFileDescriptor? = null
     private var pdfRenderer: PdfRenderer? = null
-    private var openFilePath: String? = null
 
     companion object {
         private const val TAG = "PdfHelper"
+        @Volatile private var pdfBoxInitialized = false
     }
 
-    /**
-     * Copies content Uri to a cached file so PdfRenderer can open a seekable file descriptor.
-     */
-    suspend fun cacheUriToLocalFile(uri: Uri, fileName: String): File = withContext(Dispatchers.IO) {
-        val cacheDir = File(context.cacheDir, "pdf_cache").apply { mkdirs() }
-        val safeName = fileName.replace(Regex("[^a-zA-Z0-9._-]"), "_")
-        val destFile = File(cacheDir, safeName)
-
-        context.contentResolver.openInputStream(uri)?.use { input ->
-            FileOutputStream(destFile).use { output ->
-                input.copyTo(output)
+    private fun ensurePdfBoxInitialized() {
+        if (pdfBoxInitialized) return
+        synchronized(PdfHelper::class.java) {
+            if (!pdfBoxInitialized) {
+                PDFBoxResourceLoader.init(context.applicationContext)
+                pdfBoxInitialized = true
             }
+        }
+    }
+
+    /** Copy a content URI into a unique, seekable cache file. */
+    suspend fun cacheUriToLocalFile(uri: Uri, fileName: String): File = withContext(Dispatchers.IO) {
+        val cacheDir = File(context.cacheDir, "document_cache").apply { mkdirs() }
+        val safeName = fileName.replace(Regex("[^a-zA-Z0-9._-]"), "_").take(120)
+        val destFile = File(cacheDir, "${UUID.randomUUID()}_${safeName.ifBlank { "document" }}")
+        val input = context.contentResolver.openInputStream(uri)
+            ?: throw IllegalArgumentException("Could not open the selected document.")
+        input.use { source ->
+            FileOutputStream(destFile).use { output -> source.copyTo(output) }
+        }
+        if (!destFile.isFile || destFile.length() == 0L) {
+            destFile.delete()
+            throw IllegalArgumentException("The selected document is empty or could not be copied.")
         }
         destFile
     }
 
-    /**
-     * Opens a local PDF file for rendering.
-     */
+    /** Opens a local PDF for the existing page viewer. */
+    @Synchronized
     fun openPdf(file: File): Int {
         close()
         return try {
-            fileDescriptor = ParcelFileDescriptor.open(file, ParcelFileDescriptor.MODE_READ_ONLY)
-            fileDescriptor?.let { fd ->
-                pdfRenderer = PdfRenderer(fd)
-                openFilePath = file.absolutePath
-                pdfRenderer?.pageCount ?: 0
-            } ?: 0
-        } catch (e: Exception) {
-            Log.e(TAG, "Error opening PDF: ${e.message}", e)
+            val descriptor = ParcelFileDescriptor.open(file, ParcelFileDescriptor.MODE_READ_ONLY)
+            fileDescriptor = descriptor
+            val renderer = PdfRenderer(descriptor)
+            pdfRenderer = renderer
+            renderer.pageCount
+        } catch (error: Exception) {
+            Log.e(TAG, "Unable to open PDF: ${error.message}", error)
+            close()
             0
         }
     }
 
+    @Synchronized
     fun getPageCount(): Int = pdfRenderer?.pageCount ?: 0
 
-    /**
-     * Renders a given page (0-indexed) into an Android Bitmap.
-     */
+    /** Render a zero-based page for the reader UI. */
+    @Synchronized
     fun renderPage(pageIndex: Int, targetWidth: Int = 1080): Bitmap? {
         val renderer = pdfRenderer ?: return null
-        if (pageIndex < 0 || pageIndex >= renderer.pageCount) return null
+        if (pageIndex !in 0 until renderer.pageCount || targetWidth <= 0) return null
+        val page = try {
+            renderer.openPage(pageIndex)
+        } catch (error: Exception) {
+            Log.e(TAG, "Unable to open PDF page $pageIndex", error)
+            return null
+        }
 
         return try {
-            val page = renderer.openPage(pageIndex)
             val aspect = page.height.toFloat() / page.width.toFloat()
             val targetHeight = (targetWidth * aspect).toInt().coerceAtLeast(100)
-
             val bitmap = Bitmap.createBitmap(targetWidth, targetHeight, Bitmap.Config.ARGB_8888)
-            // Fill white background for PDF page
-            val canvas = android.graphics.Canvas(bitmap)
-            canvas.drawColor(Color.WHITE)
-
+            android.graphics.Canvas(bitmap).drawColor(Color.WHITE)
             page.render(bitmap, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
-            page.close()
             bitmap
-        } catch (e: Exception) {
-            Log.e(TAG, "Error rendering page $pageIndex: ${e.message}", e)
+        } catch (error: Exception) {
+            Log.e(TAG, "Unable to render PDF page $pageIndex", error)
             null
+        } finally {
+            page.close()
         }
     }
 
     /**
-     * Extracts text from a PDF file locally.
-     * Uses a robust stream token scanner for PDF text elements (/BT ... /ET streams, Tj, TJ operators).
+     * Extract selectable text using PDFBox's PDF parser, preserving real page
+     * boundaries. It never fabricates placeholder sentences for scanned PDFs.
      */
     suspend fun extractTextByPages(file: File): List<Pair<Int, String>> = withContext(Dispatchers.IO) {
-        val result = mutableListOf<Pair<Int, String>>()
-        try {
-            val bytes = file.readBytes()
-            val content = String(bytes, Charsets.ISO_8859_1)
+        require(file.isFile && file.canRead()) { "PDF file is missing or unreadable." }
+        ensurePdfBoxInitialized()
 
-            // Split into pages or text blocks
-            val pageMarkers = Regex("/Type\\s*/Page[^s]").findAll(content).toList()
-            val numPages = pageMarkers.size.coerceAtLeast(1)
-
-            // Extract plain text between stream blocks
-            val streamRegex = Regex("stream[\\r\\n]+([\\s\\S]*?)[\\r\\n]+endstream")
-            val matches = streamRegex.findAll(content).toList()
-
-            val textChunks = mutableListOf<String>()
-            for (match in matches) {
-                val streamContent = match.groupValues[1]
-                // Look for text operators: (Text) Tj or [(T) (e) (x) (t)] TJ
-                val tjRegex = Regex("\\((.*?)\\)\\s*Tj")
-                val textParts = tjRegex.findAll(streamContent).map { it.groupValues[1] }.toList()
-                if (textParts.isNotEmpty()) {
-                    textChunks.add(textParts.joinToString(" "))
-                }
+        PDDocument.load(file).use { document ->
+            require(document.numberOfPages > 0) { "PDF contains no pages." }
+            val stripper = PDFTextStripper().apply {
+                sortByPosition = true
+                lineSeparator = "\n"
+                wordSeparator = " "
             }
 
-            if (textChunks.isNotEmpty()) {
-                val chunkSize = (textChunks.size / numPages).coerceAtLeast(1)
-                for (p in 0 until numPages) {
-                    val pageText = textChunks.drop(p * chunkSize).take(chunkSize).joinToString("\n")
-                    val cleaned = pageText.replace(Regex("\\\\[0-9]{3}"), " ").trim()
-                    result.add(Pair(p + 1, cleaned.ifBlank { "Page ${p + 1} content." }))
-                }
-            } else {
-                // Fallback: create page placeholders with file name
-                for (p in 1..numPages) {
-                    result.add(Pair(p, "Document: ${file.nameWithoutExtension} - Section page $p."))
-                }
+            (1..document.numberOfPages).map { pageNumber ->
+                stripper.startPage = pageNumber
+                stripper.endPage = pageNumber
+                val extracted = stripper.getText(document)
+                    .replace('\u0000', ' ')
+                    .replace(Regex("[\\t\\x0B\\f\\r ]+"), " ")
+                    .replace(Regex(" *\\n *"), "\n")
+                    .trim()
+                pageNumber to extracted
             }
-        } catch (e: Exception) {
-            Log.e(TAG, "Error extracting text: ${e.message}", e)
-            result.add(Pair(1, "Text content extracted from ${file.name}."))
         }
-        result
     }
 
+    @Synchronized
     fun close() {
         try {
             pdfRenderer?.close()
-        } catch (e: Exception) {
-            Log.w(TAG, "Error closing PdfRenderer: ${e.message}")
+        } catch (error: Exception) {
+            Log.w(TAG, "Error closing PdfRenderer: ${error.message}")
         }
         try {
             fileDescriptor?.close()
-        } catch (e: Exception) {
-            Log.w(TAG, "Error closing ParcelFileDescriptor: ${e.message}")
+        } catch (error: Exception) {
+            Log.w(TAG, "Error closing ParcelFileDescriptor: ${error.message}")
         }
         pdfRenderer = null
         fileDescriptor = null
-        openFilePath = null
     }
 }
