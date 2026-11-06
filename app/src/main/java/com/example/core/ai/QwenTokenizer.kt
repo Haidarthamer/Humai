@@ -1,7 +1,7 @@
 package com.example.core.ai
 
 /**
- * Tokenizer and ChatML formatter for the Qwen3 / Qwen3-VL model family.
+ * ChatML prompt formatter. Actual token IDs come only from the loaded model vocabulary in native llama.cpp.
  */
 object QwenTokenizer {
 
@@ -10,21 +10,6 @@ object QwenTokenizer {
     const val VISION_START = "<|vision_start|>"
     const val VISION_END = "<|vision_end|>"
     const val IMAGE_PAD = "<|image_pad|>"
-
-    /**
-     * Converts raw text into integer token ids using Qwen vocabulary hash rules.
-     */
-    fun tokenize(text: String): List<Int> {
-        val tokens = mutableListOf<Int>()
-        val words = text.split(Regex("\\s+|(?=[^\\p{L}\\p{Nd}])|(?<=[^\\p{L}\\p{Nd}])"))
-        for (w in words) {
-            if (w.isNotBlank()) {
-                val id = (w.hashCode() and 0x7FFFFFFF) % 151643 + 1
-                tokens.add(id)
-            }
-        }
-        return tokens
-    }
 
     /**
      * Formats multi-turn dialogue, system instructions, memories, and RAG into Qwen ChatML standard.
