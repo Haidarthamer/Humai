@@ -590,6 +590,12 @@ class CompanionViewModel(application: Application) : AndroidViewModel(applicatio
         return modelManager.getHardwareReport()
     }
 
+    fun updateContextWindow(size: Int) {
+        viewModelScope.launch(Dispatchers.IO) {
+            modelManager.updateContextWindow(size)
+        }
+    }
+
     fun selectModel(model: GGUFModelInfo) {
         // Loading multi-gigabyte GGUF weights is blocking native work; keep it off Main.
         viewModelScope.launch(Dispatchers.IO) {
