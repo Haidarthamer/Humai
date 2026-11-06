@@ -179,7 +179,7 @@ class ModelManager(private val context: Context) {
             marker.contains("mmproj") || marker.contains("projector") || marker.contains("clip") ->
                 ModelRole.VISION_PROJECTOR
             marker.contains("vision") || marker.contains("-vl") || marker.contains("_vl") ||
-                marker.contains("multimodal") -> ModelRole.VISION_MULTIMODAL
+                marker.contains("qwen3vl") || marker.contains("qwen2vl") || marker.contains("multimodal") -> ModelRole.VISION_MULTIMODAL
             marker.contains("qwen3") -> ModelRole.TEXT_DEFAULT
             else -> ModelRole.OPTIONAL_TEXT
         }
