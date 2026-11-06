@@ -136,6 +136,59 @@ object LocalEmbeddingEngine {
     }
 
     /**
+     * Corpus-aware BM25 ranking for offline RAG.
+     *
+     * Unlike the old fixed-IDF single-chunk score, this calculates document
+     * frequency across the complete local corpus, so rare query terms carry
+     * more weight than common ones. This is lexical retrieval, not a neural
+     * semantic embedding model.
+     */
+    fun <T> rankByBm25(
+        query: String,
+        documents: List<T>,
+        textOf: (T) -> String,
+        limit: Int = 3
+    ): List<Pair<T, Float>> {
+        if (limit <= 0 || documents.isEmpty()) return emptyList()
+        val queryTerms = tokenize(query).distinct()
+        if (queryTerms.isEmpty()) return emptyList()
+
+        val tokenized = documents.map { document -> document to tokenize(textOf(document)) }
+        val documentCount = tokenized.size.toFloat()
+        val averageLength = tokenized.sumOf { it.second.size.toLong() }
+            .toFloat() / documentCount
+        if (averageLength <= 0f) return emptyList()
+
+        val documentFrequency = mutableMapOf<String, Int>()
+        for (term in queryTerms) documentFrequency[term] = 0
+        tokenized.forEach { (_, tokens) ->
+            for (term in tokens.toSet()) {
+                if (documentFrequency.containsKey(term)) {
+                    documentFrequency[term] = (documentFrequency[term] ?: 0) + 1
+                }
+            }
+        }
+
+        val k1 = 1.5f
+        val b = 0.75f
+        return tokenized.mapNotNull { (document, tokens) ->
+            if (tokens.isEmpty()) return@mapNotNull null
+            val frequencies = tokens.groupingBy { it }.eachCount()
+            val lengthFactor = k1 * (1f - b + b * tokens.size / averageLength)
+            var score = 0f
+
+            for (term in queryTerms) {
+                val tf = (frequencies[term] ?: 0).toFloat()
+                if (tf <= 0f) continue
+                val df = (documentFrequency[term] ?: 0).toFloat()
+                val idf = ln(1.0 + (documentCount - df + 0.5f) / (df + 0.5f)).toFloat()
+                score += idf * (tf * (k1 + 1f)) / (tf + lengthFactor)
+            }
+            if (score > 0f) document to score else null
+        }.sortedByDescending { it.second }.take(limit)
+    }
+
+    /**
      * Extracts top 12 unique key concept words from text for indexing.
      */
     fun extractKeywords(text: String): String {
