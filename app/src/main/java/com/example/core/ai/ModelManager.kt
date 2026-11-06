@@ -7,10 +7,12 @@ import android.os.Environment
 import android.os.StatFs
 import android.util.Log
 import com.example.core.model.GGUFModelInfo
+import com.example.core.model.ModelRole
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import java.io.File
+import java.util.Locale
 
 data class HardwareReport(
     val deviceName: String,
@@ -27,218 +29,212 @@ data class HardwareReport(
     val gpuOffloadLayers: Int
 )
 
-enum class ModelLoadState {
-    UNLOADED,
-    READY_TO_LOAD,
-    LOADED,
-    ERROR
-}
+enum class ModelLoadState { UNLOADED, READY_TO_LOAD, LOADED, ERROR }
 
 class ModelManager(private val context: Context) {
 
     companion object {
         private const val TAG = "ModelManager"
         const val DEFAULT_MODEL_ID = "qwen3-4b"
+        private const val MINIMUM_MODEL_BYTES = 1L * 1024L * 1024L
     }
 
     val llamaBridge = LlamaBridge()
 
     private val _availableModels = MutableStateFlow<List<GGUFModelInfo>>(emptyList())
     val availableModels: StateFlow<List<GGUFModelInfo>> = _availableModels.asStateFlow()
-
     private val _activeModel = MutableStateFlow<GGUFModelInfo?>(null)
     val activeModel: StateFlow<GGUFModelInfo?> = _activeModel.asStateFlow()
-
     private val _modelLoadState = MutableStateFlow(ModelLoadState.UNLOADED)
     val modelLoadState: StateFlow<ModelLoadState> = _modelLoadState.asStateFlow()
-
-    private val _modelStatusDetail = MutableStateFlow("Initializing engine...")
+    private val _modelStatusDetail = MutableStateFlow("Initializing local model catalogue...")
     val modelStatusDetail: StateFlow<String> = _modelStatusDetail.asStateFlow()
-
     private val _temperature = MutableStateFlow(0.7f)
     val temperature: StateFlow<Float> = _temperature.asStateFlow()
-
-    private val _contextWindow = MutableStateFlow(4096) // Default 4096 for Snapdragon 8 Gen 3
+    private val _contextWindow = MutableStateFlow(4096)
     val contextWindow: StateFlow<Int> = _contextWindow.asStateFlow()
-
-    private val _gpuAcceleration = MutableStateFlow(false) // CPU-only llama.cpp build; Vulkan is not linked
-
+    private val _gpuAcceleration = MutableStateFlow(false)
     val gpuAcceleration: StateFlow<Boolean> = _gpuAcceleration.asStateFlow()
 
-    init {
-        refreshModelCatalog()
-    }
+    init { refreshModelCatalog() }
 
     fun getHardwareReport(): HardwareReport {
-        val actManager = context.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
-        val memInfo = ActivityManager.MemoryInfo()
-        actManager.getMemoryInfo(memInfo)
-
-        val totalRamMb = memInfo.totalMem / (1024 * 1024)
-        val availRamMb = memInfo.availMem / (1024 * 1024)
+        val activityManager = context.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
+        val memory = ActivityManager.MemoryInfo()
+        activityManager.getMemoryInfo(memory)
+        val totalRamMb = memory.totalMem / (1024L * 1024L)
+        val availableRamMb = memory.availMem / (1024L * 1024L)
 
         val stat = StatFs(Environment.getDataDirectory().path)
         val totalBytes = stat.blockCountLong * stat.blockSizeLong
-        val availBytes = stat.availableBlocksLong * stat.blockSizeLong
-        val totalStorageGb = totalBytes / (1024f * 1024f * 1024f)
-        val availStorageGb = availBytes / (1024f * 1024f * 1024f)
-
+        val availableBytes = stat.availableBlocksLong * stat.blockSizeLong
         val cores = Runtime.getRuntime().availableProcessors()
-        val abis = Build.SUPPORTED_ABIS.firstOrNull() ?: "arm64-v8a"
-
-        val deviceName = "${Build.MANUFACTURER.capitalize()} ${Build.MODEL}"
-        val isSnapdragon8Gen3 = Build.VERSION.SDK_INT >= 31 && Build.SOC_MODEL.contains("8650", ignoreCase = true)
+        val abi = Build.SUPPORTED_ABIS.firstOrNull() ?: "unknown"
+        val isSnapdragon8Gen3 =
+            Build.VERSION.SDK_INT >= 31 && Build.SOC_MODEL.contains("8650", ignoreCase = true)
+        val processor = if (isSnapdragon8Gen3) {
+            "Qualcomm Snapdragon 8 Gen 3 / Adreno 750"
+        } else {
+            "Android CPU (" + Build.SOC_MODEL.ifBlank { "unknown SoC" } + ")"
+        }
+        val recommended = _availableModels.value.firstOrNull {
+            it.modelRole == ModelRole.TEXT_DEFAULT || it.modelRole == ModelRole.OPTIONAL_TEXT
+        }
 
         return HardwareReport(
-            deviceName = if (isSnapdragon8Gen3) "$deviceName (Snapdragon 8 Gen 3)" else deviceName,
-            processorName = if (isSnapdragon8Gen3) "Qualcomm Snapdragon 8 Gen 3 (Adreno 750 GPU)" else "ARM64 Octa-Core",
+            deviceName = Build.MANUFACTURER + " " + Build.MODEL,
+            processorName = processor,
             totalRamMb = totalRamMb,
-            availableRamMb = availRamMb,
-            isLowRamDevice = memInfo.lowMemory,
-            totalStorageGb = totalStorageGb,
-            availableStorageGb = availStorageGb,
+            availableRamMb = availableRamMb,
+            isLowRamDevice = memory.lowMemory,
+            totalStorageGb = totalBytes / (1024f * 1024f * 1024f),
+            availableStorageGb = availableBytes / (1024f * 1024f * 1024f),
             cpuCores = cores,
-            supportedAbi = abis,
-            recommendedModelId = DEFAULT_MODEL_ID,
-            recommendedThreads = 6, // 6 worker threads for optimal throughput & thermal control
-            gpuOffloadLayers = 0    // No GPU backend is linked in this build
+            supportedAbi = abi,
+            recommendedModelId = recommended?.id ?: DEFAULT_MODEL_ID,
+            recommendedThreads = cores.coerceIn(2, 6),
+            gpuOffloadLayers = 0
         )
     }
 
+    /** Scan app-private storage so imported models remain visible after restart. */
     fun refreshModelCatalog() {
         val modelsDir = File(context.filesDir, "models").apply { mkdirs() }
+        val files = modelsDir.listFiles { file ->
+            file.isFile && file.extension.equals("gguf", ignoreCase = true)
+        }.orEmpty()
 
-        val qwen3File = File(modelsDir, "qwen3-4b-instruct-q4_k_m.gguf")
-        val qwen3VlFile = File(modelsDir, "qwen3-vl-4b-instruct-q4_k_m.gguf")
-        val mmprojFile = File(modelsDir, "mmproj-qwen3-vl-4b-f16.gguf")
-        val qwen25File = File(modelsDir, "qwen-2.5-1.5b.gguf")
-        val llama32File = File(modelsDir, "llama-3.2-1b.gguf")
+        val models = files.mapNotNull { file ->
+            if (!file.canRead() || file.length() < MINIMUM_MODEL_BYTES) {
+                Log.w(TAG, "Ignoring unreadable or undersized model: " + file.name)
+                return@mapNotNull null
+            }
 
-        val qwen3Valid = isUsableModelFile(qwen3File, 100L * 1024L * 1024L)
-        val qwen3VlValid = isUsableModelFile(qwen3VlFile, 100L * 1024L * 1024L)
-        val mmprojValid = isUsableModelFile(mmprojFile, 50L * 1024L * 1024L)
-        val qwen25Valid = isUsableModelFile(qwen25File, 25L * 1024L * 1024L)
-        val llama32Valid = isUsableModelFile(llama32File, 25L * 1024L * 1024L)
+            val metadata = GGUFParser.parse(file)
+            if (!metadata.isValid) {
+                Log.w(TAG, "Ignoring invalid GGUF " + file.name + ": " + metadata.errorMessage)
+                return@mapNotNull null
+            }
 
-        val predefined = listOf(
+            val role = inferModelRole(metadata.architecture, file.name)
+            val normalizedId = file.nameWithoutExtension.lowercase(Locale.ROOT)
+                .replace(Regex("[^a-z0-9._-]+"), "-").trim('-')
+            val isDefault = file.name.equals("qwen3-4b-instruct-q4_k_m.gguf", true)
+            val isLoaded = _activeModel.value?.localFilePath == file.absolutePath &&
+                llamaBridge.isModelLoaded
+
             GGUFModelInfo(
-                id = "qwen3-4b",
-                name = "Qwen3-4B Instruct",
-                architecture = "Qwen 3 (Dense)",
-                parameterCount = "4.0B",
-                quantization = "Q4_K_M",
-                fileSizeBytes = if (qwen3File.isFile) qwen3File.length() else 0L,
-                isInstalled = qwen3Valid,
-                isLoaded = _activeModel.value?.id == "qwen3-4b" && llamaBridge.isModelLoaded,
-                localFilePath = qwen3File.absolutePath,
+                id = if (isDefault) DEFAULT_MODEL_ID else "local-" + normalizedId,
+                name = metadata.modelName.takeIf { it.isNotBlank() && it != "unknown" }
+                    ?: file.nameWithoutExtension,
+                architecture = metadata.architecture,
+                parameterCount = "Not reported",
+                quantization = metadata.quantization,
+                fileSizeBytes = file.length(),
+                isInstalled = true,
+                isLoaded = isLoaded,
+                localFilePath = file.absolutePath,
                 isPreinstalled = false,
-                modelRole = com.example.core.model.ModelRole.TEXT_DEFAULT,
-                compatibility = "Requires a real GGUF file and a working native runtime; not hardware-verified",
-                integrityVerified = qwen3Valid
-            ),
-            GGUFModelInfo(
-                id = "qwen3-vl-4b",
-                name = "Qwen3-VL 4B Vision",
-                architecture = "Qwen 3 Vision-Language",
-                parameterCount = "4.2B",
-                quantization = "Q4_K_M",
-                fileSizeBytes = if (qwen3VlFile.isFile) qwen3VlFile.length() else 0L,
-                isInstalled = qwen3VlValid,
-                isLoaded = _activeModel.value?.id == "qwen3-vl-4b" && llamaBridge.isModelLoaded,
-                localFilePath = qwen3VlFile.absolutePath,
-                isPreinstalled = false,
-                modelRole = com.example.core.model.ModelRole.VISION_MULTIMODAL,
-                compatibility = "Requires compatible vision GGUF files and a multimodal native runtime; not verified",
-                integrityVerified = qwen3VlValid
-            ),
-            GGUFModelInfo(
-                id = "mmproj-qwen3-vl-4b",
-                name = "Qwen3-VL Multimodal Projector",
-                architecture = "CLIP Vision Projector (mmproj)",
-                parameterCount = "Vision Adapter",
-                quantization = "F16",
-                fileSizeBytes = if (mmprojFile.isFile) mmprojFile.length() else 0L,
-                isInstalled = mmprojValid,
-                isLoaded = false,
-                localFilePath = mmprojFile.absolutePath,
-                isPreinstalled = false,
-                modelRole = com.example.core.model.ModelRole.VISION_PROJECTOR,
-                compatibility = "Requires a compatible multimodal native runtime; not verified",
-                integrityVerified = mmprojValid
-            ),
-            GGUFModelInfo(
-                id = "qwen-2.5-1.5b",
-                name = "Qwen 2.5 1.5B Instruct",
-                architecture = "Qwen 2.5",
-                parameterCount = "1.5B",
-                quantization = "Q4_K_M",
-                fileSizeBytes = if (qwen25File.isFile) qwen25File.length() else 0L,
-                isInstalled = qwen25Valid,
-                isLoaded = _activeModel.value?.id == "qwen-2.5-1.5b" && llamaBridge.isModelLoaded,
-                localFilePath = qwen25File.absolutePath,
-                isPreinstalled = false,
-                modelRole = com.example.core.model.ModelRole.OPTIONAL_TEXT,
-                compatibility = "Low RAM / Mid-Tier Fallback",
-                integrityVerified = qwen25Valid
-            ),
-            GGUFModelInfo(
-                id = "llama-3.2-1b",
-                name = "Llama 3.2 1B Instruct",
-                architecture = "Llama 3.2",
-                parameterCount = "1.2B",
-                quantization = "Q4_K_M",
-                fileSizeBytes = if (llama32File.isFile) llama32File.length() else 0L,
-                isInstalled = llama32Valid,
-                isLoaded = _activeModel.value?.id == "llama-3.2-1b" && llamaBridge.isModelLoaded,
-                localFilePath = llama32File.absolutePath,
-                isPreinstalled = false,
-                modelRole = com.example.core.model.ModelRole.OPTIONAL_TEXT,
-                compatibility = "Low RAM / Mid-Tier Fallback",
-                integrityVerified = llama32Valid
+                modelRole = role,
+                compatibility = when (role) {
+                    ModelRole.VISION_MULTIMODAL -> "Vision runtime is not integrated in this build"
+                    ModelRole.VISION_PROJECTOR -> "Projector file; requires a compatible multimodal runtime"
+                    else -> if (LlamaBridge.isNativeAvailable()) {
+                        "Text model; CPU llama.cpp runtime"
+                    } else {
+                        "Text model; native runtime must be built into the APK"
+                    }
+                },
+                // Parser accepted the GGUF header/metadata. This is not a full
+                // checksum verification of every tensor block.
+                integrityVerified = true
             )
+        }.sortedWith(
+            compareByDescending<GGUFModelInfo> { it.id == DEFAULT_MODEL_ID }
+                .thenBy { it.name.lowercase(Locale.ROOT) }
         )
 
-        _availableModels.value = predefined
-        if (_activeModel.value == null) {
-            val defaultModel = predefined.first() // Qwen3-4B
-            _activeModel.value = defaultModel
-            loadSelectedModel(defaultModel)
+        _availableModels.value = models
+        val oldPath = _activeModel.value?.localFilePath
+        val selected = models.firstOrNull { it.localFilePath == oldPath } ?: models.firstOrNull {
+            it.modelRole == ModelRole.TEXT_DEFAULT || it.modelRole == ModelRole.OPTIONAL_TEXT
+        }
+        _activeModel.value = selected
+
+        if (selected == null) {
+            _modelLoadState.value = ModelLoadState.READY_TO_LOAD
+            _modelStatusDetail.value = "No valid local GGUF model imported. Import a text GGUF model to begin."
+        } else if (llamaBridge.isModelLoaded && llamaBridge.currentModelPath == selected.localFilePath) {
+            _modelLoadState.value = ModelLoadState.LOADED
+            _modelStatusDetail.value = "Loaded in memory (" + selected.quantization + ")"
+        } else {
+            _modelLoadState.value = ModelLoadState.READY_TO_LOAD
+            _modelStatusDetail.value = "Found " + selected.name + "; select it to load into memory."
+        }
+    }
+
+    private fun inferModelRole(architecture: String, fileName: String): ModelRole {
+        val marker = architecture.lowercase(Locale.ROOT) + " " + fileName.lowercase(Locale.ROOT)
+        return when {
+            marker.contains("mmproj") || marker.contains("projector") || marker.contains("clip") ->
+                ModelRole.VISION_PROJECTOR
+            marker.contains("vision") || marker.contains("-vl") || marker.contains("_vl") ||
+                marker.contains("multimodal") -> ModelRole.VISION_MULTIMODAL
+            marker.contains("qwen3") -> ModelRole.TEXT_DEFAULT
+            else -> ModelRole.OPTIONAL_TEXT
         }
     }
 
     fun selectModel(model: GGUFModelInfo) {
-        if (model.modelRole == com.example.core.model.ModelRole.VISION_MULTIMODAL ||
-            model.modelRole == com.example.core.model.ModelRole.VISION_PROJECTOR
+        if (model.modelRole == ModelRole.VISION_MULTIMODAL ||
+            model.modelRole == ModelRole.VISION_PROJECTOR
         ) {
             _modelLoadState.value = ModelLoadState.ERROR
-            _modelStatusDetail.value = "Vision inference is not integrated in this build; this file cannot be selected as a text model."
+            _modelStatusDetail.value =
+                "Vision inference is not integrated in this build; this file cannot be selected as a text model."
             return
         }
-        _activeModel.value = model
-        loadSelectedModel(model)
-        refreshModelCatalog()
+
+        val latest = _availableModels.value.firstOrNull { it.localFilePath == model.localFilePath }
+        if (latest == null) {
+            _modelLoadState.value = ModelLoadState.ERROR
+            _modelStatusDetail.value = "Model file is no longer present. Refresh the catalogue and import it again."
+            return
+        }
+        _activeModel.value = latest
+        loadSelectedModel(latest)
     }
 
     private fun loadSelectedModel(model: GGUFModelInfo) {
-        val file = model.localFilePath?.let { File(it) } ?: File(context.filesDir, "models/${model.id}.gguf")
-        if (file.exists()) {
-            val result = llamaBridge.loadModel(
-                modelFile = file,
-                nGpuLayers = 0,
-                contextSize = _contextWindow.value,
-                nThreads = 6
-            )
-            if (result.isSuccess) {
-                _modelLoadState.value = ModelLoadState.LOADED
-                _modelStatusDetail.value = "Loaded in memory (${model.quantization}, 4096 ctx)"
-            } else {
-                _modelLoadState.value = ModelLoadState.ERROR
-                _modelStatusDetail.value = result.exceptionOrNull()?.message ?: "Load failed"
-            }
-        } else {
-            // Check if model file needs to be imported
+        val file = model.localFilePath?.let(::File)
+        if (file == null || !file.isFile) {
             _modelLoadState.value = ModelLoadState.READY_TO_LOAD
-            _modelStatusDetail.value = "Model file not installed on disk. Import '${file.name}' to deploy."
+            _modelStatusDetail.value = "Model file is not present on disk."
+            return
+        }
+
+        _modelLoadState.value = ModelLoadState.UNLOADED
+        _modelStatusDetail.value = "Loading " + file.name + " with the local CPU runtime..."
+        val result = llamaBridge.loadModel(
+            modelFile = file,
+            nGpuLayers = 0,
+            contextSize = _contextWindow.value,
+            nThreads = Runtime.getRuntime().availableProcessors().coerceIn(2, 6)
+        )
+        if (result.isSuccess) {
+            _modelLoadState.value = ModelLoadState.LOADED
+            _modelStatusDetail.value =
+                "Loaded in memory (" + model.quantization + ", " + _contextWindow.value + " context)"
+            refreshModelCatalogFlagsOnly()
+        } else {
+            _modelLoadState.value = ModelLoadState.ERROR
+            _modelStatusDetail.value = result.exceptionOrNull()?.message ?: "Model load failed."
+        }
+    }
+
+    private fun refreshModelCatalogFlagsOnly() {
+        _availableModels.value = _availableModels.value.map { model ->
+            model.copy(isLoaded = model.localFilePath == llamaBridge.currentModelPath && llamaBridge.isModelLoaded)
         }
     }
 
@@ -251,35 +247,44 @@ class ModelManager(private val context: Context) {
     }
 
     fun setGpuAcceleration(enabled: Boolean) {
-        // Prevent the UI from claiming GPU offload before a Vulkan backend is built.
         _gpuAcceleration.value = false
-    }
-
-    private fun isUsableModelFile(file: File, minimumBytes: Long): Boolean {
-        if (!file.isFile || !file.canRead() || file.length() < minimumBytes) return false
-        return GGUFParser.parse(file).isValid
     }
 
     fun registerImportedModel(file: File): GGUFModelInfo {
         require(file.isFile && file.canRead()) { "Selected model file is missing or unreadable." }
-        require(file.length() >= 1L * 1024L * 1024L) {
-            "Selected file is too small to be a real model. The repository's bundled 1.2 KB files are placeholders, not GGUF weights."
+        require(file.length() >= MINIMUM_MODEL_BYTES) { "Selected file is too small to be a real GGUF model." }
+        val metadata = GGUFParser.parse(file)
+        require(metadata.isValid) {
+            "Selected file is not a valid GGUF model: " + metadata.errorMessage
         }
-        val meta = GGUFParser.parse(file)
-        require(meta.isValid) { "Selected file is not a valid GGUF model: ${meta.errorMessage}" }
-        val model = GGUFModelInfo(
-            id = "custom-${file.nameWithoutExtension}",
-            name = if (meta.isValid) meta.modelName else file.name,
-            architecture = if (meta.isValid) meta.architecture else "Custom GGUF",
-            parameterCount = "${meta.tensorCount} tensors",
-            quantization = if (meta.isValid) meta.quantization else "GGUF",
-            fileSizeBytes = file.length(),
-            isInstalled = true,
-            isLoaded = false,
-            localFilePath = file.absolutePath
-        )
+
+        val role = inferModelRole(metadata.architecture, file.name)
+        refreshModelCatalog()
+        val model = _availableModels.value.firstOrNull { it.localFilePath == file.absolutePath }
+            ?: GGUFModelInfo(
+                id = "local-" + file.nameWithoutExtension.lowercase(Locale.ROOT),
+                name = metadata.modelName.takeIf { it.isNotBlank() && it != "unknown" }
+                    ?: file.nameWithoutExtension,
+                architecture = metadata.architecture,
+                parameterCount = "Not reported",
+                quantization = metadata.quantization,
+                fileSizeBytes = file.length(),
+                isInstalled = true,
+                isLoaded = false,
+                localFilePath = file.absolutePath,
+                isPreinstalled = false,
+                modelRole = role,
+                compatibility = "Imported local model",
+                integrityVerified = true
+            )
+
+        if (role == ModelRole.VISION_MULTIMODAL || role == ModelRole.VISION_PROJECTOR) {
+            _modelStatusDetail.value =
+                "Vision file imported, but multimodal inference is not integrated in this build."
+            return model
+        }
+
         _activeModel.value = model
-        _availableModels.value = _availableModels.value + model
         loadSelectedModel(model)
         return model
     }
