@@ -1,0 +1,6 @@
+{
+  "name": "Companion AI",
+  "description": "Offline personal AI companion that reads PDFs, learns from media, remembers conversations, and simulates personality and emotions.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
