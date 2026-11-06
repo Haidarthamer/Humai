@@ -4,6 +4,8 @@ import android.util.Log
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
+import kotlinx.coroutines.flow.flowOn
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import java.io.File
@@ -165,7 +167,7 @@ class LlamaBridge {
             throw ModelNotLoadedException("Native inference function unavailable: ${error.message}")
         }
         }
-    }
+    }.flowOn(Dispatchers.Default)
 
     private external fun nativeLoadModel(path: String, gpuLayers: Int, ctxSize: Int, threads: Int): Long
     private external fun nativeUnloadModel(modelPtr: Long, ctxPtr: Long)
