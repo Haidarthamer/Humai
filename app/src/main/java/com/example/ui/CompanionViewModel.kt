@@ -236,9 +236,28 @@ class CompanionViewModel(application: Application) : AndroidViewModel(applicatio
 
             var imagePrompt: String? = null
             if (imageToProcess != null) {
-                _streamingMessageText.value = "[Qwen3-VL Analyzing visual features...]"
-                val analysis = visionEngine.analyzeImage(imageToProcess)
-                imagePrompt = analysis.sceneDescription
+                _streamingMessageText.value = ""
+                try {
+                    val analysis = visionEngine.analyzeImage(imageToProcess)
+                    imagePrompt = analysis.sceneDescription
+                } catch (error: Exception) {
+                    val message = when (_languageMode.value) {
+                        LanguageMode.ARABIC_IRAQI -> "تحليل الصور المحلي مو مفعّل بهذي النسخة بعد. ما راح أخمّن محتوى الصورة؛ استورد نص أو استخدم المحادثة بدون مرفق حالياً."
+                        LanguageMode.ARABIC_MSA -> "تحليل الصور المحلي غير متاح في هذا الإصدار. لن أخمّن محتوى الصورة."
+                        LanguageMode.ENGLISH -> "Local image understanding is not available in this build. I won't guess what the image contains."
+                    }
+                    messageDao.insertMessage(
+                        MessageEntity(
+                            conversationId = convId,
+                            isUser = false,
+                            content = message,
+                            emotionTag = "CONFUSION"
+                        )
+                    )
+                    _streamingMessageText.value = ""
+                    _isGenerating.value = false
+                    return@launch
+                }
             }
 
             // Perform Hybrid RAG Search across local Knowledge Chunks
