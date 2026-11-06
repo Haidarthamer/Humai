@@ -2,12 +2,14 @@ package com.example.core.ai
 
 import kotlin.math.ln
 import kotlin.math.sqrt
+import java.util.Locale
 
 /**
- * High-performance, offline semantic embedding and RAG search engine.
- * Generates 64-dimensional dense semantic vectors using subword character n-gram projections
- * and computes hybrid BM25 + Cosine Similarity.
- * Fully supports English, Modern Standard Arabic, and Iraqi Arabic text.
+ * Offline lexical retrieval helpers for RAG.
+ * The 64-dimensional vectors below are deterministic word/character-hash fingerprints,
+ * NOT neural semantic embeddings. They can supplement keyword/BM25 matching but do not
+ * understand synonyms or meaning. A trained multilingual embedding model is still required
+ * for true semantic retrieval.
  */
 object LocalEmbeddingEngine {
 
@@ -35,8 +37,8 @@ object LocalEmbeddingEngine {
     }
 
     /**
-     * Creates a deterministic 64-dimensional dense semantic vector
-     * using character tri-grams and whole-word hashing.
+     * Creates a deterministic lexical fingerprint using character tri-grams and word hashes.
+     * This is not a model-generated embedding.
      */
     fun generateEmbedding(text: String): FloatArray {
         val tokens = tokenize(text)
@@ -92,7 +94,7 @@ object LocalEmbeddingEngine {
      * Serializes FloatArray to string for Room storage.
      */
     fun vectorToString(vector: FloatArray): String {
-        return vector.joinToString(",") { "%.4f".format(it) }
+        return vector.joinToString(",") { String.format(Locale.US, "%.4f", it) }
     }
 
     /**
