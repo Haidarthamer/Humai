@@ -561,7 +561,7 @@ fun BrainScreen(
                 }
                 Slider(
                     value = contextWindow.toFloat(),
-                    onValueChange = { viewModel.modelManager.updateContextWindow(it.toInt()) },
+                    onValueChange = { viewModel.updateContextWindow(it.toInt()) },
                     valueRange = 1024f..8192f,
                     steps = 6,
                     colors = SliderDefaults.colors(thumbColor = CompanionCyan, activeTrackColor = CompanionCyan)
