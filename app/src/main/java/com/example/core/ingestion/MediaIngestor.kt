@@ -27,6 +27,11 @@ import kotlinx.coroutines.withContext
 import java.io.File
 import java.io.FileOutputStream
 
+private fun formatVideoTime(seconds: Double): String {
+    val whole = seconds.toLong().coerceAtLeast(0L)
+    return "%02d:%02d".format(java.util.Locale.ROOT, whole / 60L, whole % 60L)
+}
+
 class MediaIngestor(
     private val context: Context,
     private val documentDao: DocumentDao,
@@ -106,19 +111,31 @@ class MediaIngestor(
                     }
                 }
 
-                // Correlate corresponding Whisper audio transcription segment
-                val audioText = audioSegments.find { sec in it.startSeconds..it.endSeconds }?.text ?: ""
-                val visualDesc = if (frameBitmap != null) {
+                // Associate every Whisper segment overlapping this frame's time window.
+                // A single exact-second lookup silently dropped most speech between keyframes.
+                val windowEndSec = minOf(durationSec, sec + intervalSec)
+                val overlappingAudio = audioSegments.filter { segment ->
+                    segment.endSeconds >= sec && segment.startSeconds < windowEndSec
+                }
+                val audioText = overlappingAudio.joinToString("\n") { segment ->
+                    val start = segment.startSeconds.coerceAtLeast(0.0)
+                    val end = segment.endSeconds.coerceAtLeast(start)
+                    "[${formatVideoTime(start)}-${formatVideoTime(end)}] ${segment.text}"
+                }
+                val visualDesc = if (frameBitmap != null && frameFile.isFile && frameFile.length() > 0L) {
                     val frameAnalysis = visionEngine.analyzeImage(Uri.fromFile(frameFile))
-                    "Video keyframe [${sec / 60}m:${sec % 60}s]: ${frameAnalysis.sceneDescription}"
+                    "Video keyframe [${formatVideoTime(sec.toDouble())}]: ${frameAnalysis.sceneDescription}"
                 } else {
-                    "No frame could be extracted at ${sec}s."
+                    "No frame could be extracted at ${formatVideoTime(sec.toDouble())}."
                 }
 
                 val combinedContent = buildString {
-                    append(visualDesc)
+                    append("Timeline window [${formatVideoTime(sec.toDouble())}-${formatVideoTime(windowEndSec.toDouble())}]")
+                    append("\nVisual: ").append(visualDesc)
                     if (audioText.isNotBlank()) {
-                        append("\nWhisper Audio Transcription: \"").append(audioText).append("\"")
+                        append("\nAudio transcript:\n").append(audioText)
+                    } else {
+                        append("\nAudio transcript: no speech detected in this window.")
                     }
                 }
 
