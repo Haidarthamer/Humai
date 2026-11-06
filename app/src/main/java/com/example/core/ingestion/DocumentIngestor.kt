@@ -230,7 +230,7 @@ class DocumentIngestor(
         val extracted = output.toString()
             .replace('\u0000', ' ')
             .replace(Regex("[ \\t]+"), " ")
-            .replace(Regex(" *\\n *"), "\\n")
+            .replace(Regex(" *\\n *"), "\n")
             .trim()
         require(extracted.isNotBlank()) { "No selectable text was found in this DOCX file." }
         return extracted
