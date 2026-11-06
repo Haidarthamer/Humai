@@ -118,9 +118,9 @@ class MediaIngestor(
                     segment.endSeconds >= sec && segment.startSeconds < windowEndSec
                 }
                 val audioText = overlappingAudio.joinToString("\n") { segment ->
-                    val start = segment.startSeconds.coerceAtLeast(0.0)
-                    val end = segment.endSeconds.coerceAtLeast(start)
-                    "[${formatVideoTime(start)}-${formatVideoTime(end)}] ${segment.text}"
+                    val startSeconds = segment.startSeconds.coerceAtLeast(0L)
+                    val endSeconds = segment.endSeconds.coerceAtLeast(startSeconds)
+                    "[${formatVideoTime(startSeconds.toDouble())}-${formatVideoTime(endSeconds.toDouble())}] ${segment.text}"
                 }
                 val visualDesc = if (frameBitmap != null && frameFile.isFile && frameFile.length() > 0L) {
                     val frameAnalysis = visionEngine.analyzeImage(Uri.fromFile(frameFile))
