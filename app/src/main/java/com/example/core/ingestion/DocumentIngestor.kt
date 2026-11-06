@@ -17,10 +17,13 @@ import com.example.database.dao.MemoryDao
 import com.example.database.entities.DocumentEntity
 import com.example.database.entities.KnowledgeChunkEntity
 import com.example.database.entities.MemoryEntity
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withContext
 import java.io.File
-import java.util.concurrent.atomic.AtomicBoolean
 import java.util.zip.ZipInputStream
 import org.xmlpull.v1.XmlPullParser
 
@@ -34,12 +37,6 @@ class DocumentIngestor(
     private val pdfHelper: PdfHelper
 ) {
 
-    private val isCancelled = AtomicBoolean(false)
-
-    fun cancel() {
-        isCancelled.set(true)
-    }
-
     suspend fun ingestDocument(
         uri: Uri,
         fileName: String,
@@ -47,8 +44,6 @@ class DocumentIngestor(
         language: LanguageMode,
         onProgress: (Float, String) -> Unit = { _, _ -> }
     ): Long = withContext(Dispatchers.IO) {
-        isCancelled.set(false)
-
         onProgress(0.05f, "Preparing file cache...")
         val cachedFile = pdfHelper.cacheUriToLocalFile(uri, fileName)
         val fileSize = cachedFile.length()
@@ -89,10 +84,7 @@ class DocumentIngestor(
                 }
             }
 
-            if (isCancelled.get()) {
-                documentDao.updateDocument(initialEntity.copy(id = docId, status = IngestionStatus.CANCELLED))
-                return@withContext docId
-            }
+            currentCoroutineContext().ensureActive()
 
             onProgress(0.40f, "Generating neural summary and concepts...")
             val fullText = pagesData.joinToString("\n") { it.second }
@@ -104,12 +96,14 @@ class DocumentIngestor(
             var chunkIndex = 0
 
             for ((pageNumber, pageText) in pagesData) {
+                currentCoroutineContext().ensureActive()
                 val words = pageText.split(Regex("\\s+")).filter { it.isNotBlank() }
                 val windowSize = 120
                 val overlap = 20
 
                 var i = 0
                 while (i < words.size) {
+                    currentCoroutineContext().ensureActive()
                     val chunkWords = words.subList(i, (i + windowSize).coerceAtMost(words.size))
                     val chunkText = chunkWords.joinToString(" ")
                     val vector = LocalEmbeddingEngine.generateEmbedding(chunkText)
@@ -175,6 +169,18 @@ class DocumentIngestor(
 
             onProgress(1.0f, "Knowledge assimilation complete!")
             docId
+        } catch (cancelled: CancellationException) {
+            withContext(NonCancellable) {
+                documentDao.updateDocument(
+                    initialEntity.copy(
+                        id = docId,
+                        status = IngestionStatus.CANCELLED,
+                        progress = 0f,
+                        summary = "Import cancelled."
+                    )
+                )
+            }
+            throw cancelled
         } catch (e: Exception) {
             val failedEntity = initialEntity.copy(
                 id = docId,
