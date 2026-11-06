@@ -1,6 +1,8 @@
 #include <jni.h>
 #include <android/log.h>
 #include "llama.h"
+#include "mtmd.h"
+#include "mtmd-helper.h"
 
 #include <algorithm>
 #include <cstdint>
