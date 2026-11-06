@@ -38,6 +38,37 @@ class ExampleUnitTest {
     }
 
     @Test
+    fun testCorpusAwareBm25PrefersChunksWithRelevantRareTerms() {
+        val documents = listOf(
+            "A general introduction to astronomy and stars.",
+            "Quasar physics explains energetic galactic nuclei.",
+            "Quasar observations in modern astrophysics."
+        )
+
+        val ranked = LocalEmbeddingEngine.rankByBm25(
+            query = "quasar physics",
+            documents = documents,
+            textOf = { it },
+            limit = 3
+        )
+
+        assertEquals(2, ranked.size)
+        assertEquals(documents[1], ranked.first().first)
+        assertTrue(ranked.first().second > ranked.last().second)
+    }
+
+    @Test
+    fun testCorpusAwareBm25ReturnsNoMatchForUnrelatedQuery() {
+        val ranked = LocalEmbeddingEngine.rankByBm25(
+            query = "volcano",
+            documents = listOf("local model", "offline document"),
+            textOf = { it },
+            limit = 3
+        )
+        assertTrue(ranked.isEmpty())
+    }
+
+    @Test
     fun testChatMLFormatting() {
         val chatML = QwenTokenizer.formatChatML(
             systemPrompt = "You are a local assistant.",
