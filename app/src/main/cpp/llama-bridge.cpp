@@ -297,4 +297,120 @@ Java_com_example_core_ai_LlamaBridge_nativeTokenize(JNIEnv * env, jobject, jlong
     return out;
 }
 
+
+JNIEXPORT jstring JNICALL
+Java_com_example_core_ai_QwenVisionEngine_nativeAnalyzeImage(
+    JNIEnv * env, jobject, jstring model_path, jstring projector_path,
+    jbyteArray image_bytes, jstring prompt_text, jint threads, jint max_tokens
+) {
+    if (!model_path || !projector_path || !image_bytes || !prompt_text) return nullptr;
+    const char * m = env->GetStringUTFChars(model_path, nullptr);
+    const char * p = env->GetStringUTFChars(projector_path, nullptr);
+    const char * q = env->GetStringUTFChars(prompt_text, nullptr);
+    if (!m || !p || !q) {
+        if (m) env->ReleaseStringUTFChars(model_path, m);
+        if (p) env->ReleaseStringUTFChars(projector_path, p);
+        if (q) env->ReleaseStringUTFChars(prompt_text, q);
+        return nullptr;
+    }
+    const std::string model_file(m), projector_file(p), prompt(q);
+    env->ReleaseStringUTFChars(model_path, m);
+    env->ReleaseStringUTFChars(projector_path, p);
+    env->ReleaseStringUTFChars(prompt_text, q);
+
+    const jsize byte_count = env->GetArrayLength(image_bytes);
+    if (byte_count <= 0 || byte_count > 32 * 1024 * 1024) return nullptr;
+    jbyte * bytes = env->GetByteArrayElements(image_bytes, nullptr);
+    if (!bytes) return nullptr;
+
+    std::call_once(g_backend_init_once, [] { llama_backend_init(); });
+    llama_model_params mp = llama_model_default_params();
+    mp.n_gpu_layers = 0;
+    llama_model * model = llama_model_load_from_file(model_file.c_str(), mp);
+    if (!model) {
+        env->ReleaseByteArrayElements(image_bytes, bytes, JNI_ABORT);
+        return nullptr;
+    }
+
+    llama_context_params cp = llama_context_default_params();
+    cp.n_ctx = 4096;
+    cp.n_batch = 512;
+    cp.n_ubatch = 512;
+    cp.n_threads = std::max(1, std::min(threads, 6));
+    cp.n_threads_batch = cp.n_threads;
+    llama_context * context = llama_init_from_model(model, cp);
+    if (!context) {
+        llama_model_free(model);
+        env->ReleaseByteArrayElements(image_bytes, bytes, JNI_ABORT);
+        return nullptr;
+    }
+
+    mtmd_context_params vp = mtmd_context_params_default();
+    vp.use_gpu = false;
+    vp.print_timings = false;
+    vp.n_threads = cp.n_threads;
+    mtmd_context * vision = mtmd_init_from_file(projector_file.c_str(), model, vp);
+    if (!vision) {
+        llama_free(context);
+        llama_model_free(model);
+        env->ReleaseByteArrayElements(image_bytes, bytes, JNI_ABORT);
+        return nullptr;
+    }
+
+    mtmd_helper_init_opt options = mtmd_helper_init_opt_default();
+    mtmd_helper_bitmap_wrapper wrapper = mtmd_helper_bitmap_init_from_buf(
+        vision, reinterpret_cast<const unsigned char *>(bytes),
+        static_cast<size_t>(byte_count), false, options);
+    env->ReleaseByteArrayElements(image_bytes, bytes, JNI_ABORT);
+
+    std::string answer;
+    if (wrapper.bitmap) {
+        mtmd_input_chunks * chunks = mtmd_input_chunks_init();
+        mtmd_input_text input = { prompt.c_str(), prompt.size(), true, true };
+        const mtmd_bitmap * bitmaps[] = { wrapper.bitmap };
+        const int tokenized = mtmd_tokenize(vision, chunks, &input, bitmaps, 1);
+        llama_pos next_pos = 0;
+        const int evaluated = tokenized == 0
+            ? mtmd_helper_eval_chunks(vision, context, chunks, 0, 0, 512, true, &next_pos)
+            : -1;
+
+        const llama_vocab * vocab = llama_model_get_vocab(model);
+        llama_sampler * sampler = llama_sampler_init_greedy();
+        if (evaluated == 0 && vocab && sampler) {
+            const int limit = std::max(1, std::min(max_tokens, 512));
+            for (int i = 0; i < limit; ++i) {
+                const llama_token token = llama_sampler_sample(sampler, context, -1);
+                if (llama_vocab_is_eog(vocab, token)) break;
+                char piece[512];
+                const int32_t n = llama_token_to_piece(vocab, token, piece, sizeof(piece), 0, false);
+                if (n > 0) answer.append(piece, static_cast<size_t>(n));
+
+                llama_batch batch = llama_batch_init(1, 0, 1);
+                if (!batch.token || !batch.seq_id) {
+                    if (batch.token) llama_batch_free(batch);
+                    break;
+                }
+                batch.n_tokens = 1;
+                batch.token[0] = token;
+                batch.pos[0] = next_pos++;
+                batch.n_seq_id[0] = 1;
+                batch.seq_id[0][0] = 0;
+                batch.logits[0] = 1;
+                const int decoded = llama_decode(context, batch);
+                llama_batch_free(batch);
+                if (decoded != 0) break;
+            }
+        }
+        if (sampler) llama_sampler_free(sampler);
+        mtmd_input_chunks_free(chunks);
+        mtmd_bitmap_free(wrapper.bitmap);
+        if (wrapper.video_ctx) mtmd_helper_video_free(wrapper.video_ctx);
+    }
+    mtmd_free(vision);
+    llama_free(context);
+    llama_model_free(model);
+    if (answer.empty()) return nullptr;
+    return utf8_to_java(env, answer);
+}
+
 } // extern "C"
