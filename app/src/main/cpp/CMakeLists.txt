@@ -39,7 +39,7 @@ set(WHISPER_ALL_WARNINGS OFF CACHE BOOL "" FORCE)
 FetchContent_Declare(
     whisper_cpp
     GIT_REPOSITORY https://github.com/ggml-org/whisper.cpp.git
-    GIT_TAG v1.7.6
+    GIT_TAG v1.9.5
     GIT_SHALLOW TRUE
 )
 FetchContent_MakeAvailable(whisper_cpp)
