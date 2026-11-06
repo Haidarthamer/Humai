@@ -41,6 +41,7 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -68,6 +69,9 @@ import com.example.ui.theme.CompanionTextPrimary
 import com.example.ui.theme.CompanionTextSecondary
 import java.io.File
 import java.io.FileOutputStream
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 @Composable
 fun BrainScreen(
@@ -75,6 +79,7 @@ fun BrainScreen(
     modifier: Modifier = Modifier
 ) {
     val context = LocalContext.current
+    val importScope = rememberCoroutineScope()
     val models by viewModel.modelManager.availableModels.collectAsState()
     val activeModel by viewModel.modelManager.activeModel.collectAsState()
     val temperature by viewModel.modelManager.temperature.collectAsState()
@@ -89,27 +94,55 @@ fun BrainScreen(
     val customModelPicker = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenDocument()
     ) { uri: Uri? ->
-        uri?.let {
-            val displayName = context.contentResolver.query(
-                uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null
-            )?.use { cursor ->
-                if (cursor.moveToFirst()) cursor.getString(0) else null
-            } ?: uri.lastPathSegment ?: "imported_model.gguf"
-            val fileName = displayName.substringAfterLast('/').substringAfterLast('\\')
-                .replace(Regex("[^a-zA-Z0-9._-]"), "_")
-            val destFile = File(context.filesDir, "models/${System.currentTimeMillis()}_${fileName}")
-            try {
-                destFile.parentFile?.mkdirs()
-                val input = context.contentResolver.openInputStream(uri)
-                    ?: throw IllegalArgumentException("Cannot open selected file.")
-                input.use { inp ->
-                    FileOutputStream(destFile).use { out -> inp.copyTo(out) }
+        uri?.let { selectedUri ->
+            importScope.launch {
+                var copiedFile: File? = null
+                try {
+                    val model = withContext(Dispatchers.IO) {
+                        val displayName = context.contentResolver.query(
+                            selectedUri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null
+                        )?.use { cursor ->
+                            if (cursor.moveToFirst()) cursor.getString(0) else null
+                        } ?: selectedUri.lastPathSegment ?: "imported_model.gguf"
+
+                        val fileName = displayName.substringAfterLast('/').substringAfterLast('\\')
+                            .replace(Regex("[^a-zA-Z0-9._-]"), "_")
+                        val destination = File(
+                            context.filesDir,
+                            "models/${System.currentTimeMillis()}_${fileName}"
+                        )
+                        copiedFile = destination
+                        destination.parentFile?.mkdirs()
+
+                        val input = context.contentResolver.openInputStream(selectedUri)
+                            ?: throw IllegalArgumentException("Cannot open selected file.")
+                        input.use { source ->
+                            FileOutputStream(destination).use { output ->
+                                source.copyTo(output)
+                            }
+                        }
+
+                        // Parsing GGUF metadata and loading native weights can take
+                        // seconds and allocate gigabytes. Never do this on Main.
+                        viewModel.modelManager.registerImportedModel(destination)
+                    }
+
+                    val status = if (viewModel.modelManager.modelLoadState.value ==
+                        com.example.core.ai.ModelLoadState.LOADED
+                    ) {
+                        "Model imported and loaded."
+                    } else {
+                        viewModel.modelManager.modelStatusDetail.value
+                    }
+                    Toast.makeText(context, status, Toast.LENGTH_LONG).show()
+                } catch (error: Exception) {
+                    withContext(Dispatchers.IO) { copiedFile?.delete() }
+                    Toast.makeText(
+                        context,
+                        "Import failed: ${error.message ?: "Unknown error"}",
+                        Toast.LENGTH_LONG
+                    ).show()
                 }
-                viewModel.modelManager.registerImportedModel(destFile)
-                Toast.makeText(context, "Model imported and validated.", Toast.LENGTH_SHORT).show()
-            } catch (error: Exception) {
-                destFile.delete()
-                Toast.makeText(context, "Import failed: ${error.message}", Toast.LENGTH_LONG).show()
             }
         }
     }
@@ -365,7 +398,7 @@ fun BrainScreen(
                             )
                             Row(verticalAlignment = Alignment.CenterVertically) {
                                 val statusText = if (model.isInstalled) {
-                                    if (model.integrityVerified) "Installed & Verified (GGUF v3)" else "Installed"
+                                    if (model.integrityVerified) "GGUF header parsed" else "Installed"
                                 } else "Not imported"
                                 Text(
                                     text = "Status: $statusText • ${model.compatibility}",
