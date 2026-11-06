@@ -86,9 +86,26 @@ class PdfHelper(private val context: Context) {
         }
 
         return try {
-            val aspect = page.height.toFloat() / page.width.toFloat()
-            val targetHeight = (targetWidth * aspect).toInt().coerceAtLeast(100)
-            val bitmap = Bitmap.createBitmap(targetWidth, targetHeight, Bitmap.Config.ARGB_8888)
+            val sourceWidth = page.width.coerceAtLeast(1)
+            val sourceHeight = page.height.coerceAtLeast(1)
+            val requestedWidth = targetWidth.coerceIn(1, 2048)
+            val requestedHeight = (requestedWidth.toDouble() * sourceHeight / sourceWidth)
+                .toInt().coerceAtLeast(1)
+
+            // Keep unusually tall/wide PDFs from allocating a bitmap large enough
+            // to trigger an app-wide memory failure on mobile devices.
+            val pixelScale = kotlin.math.sqrt(
+                12_000_000.0 / (requestedWidth.toDouble() * requestedHeight)
+            ).coerceAtMost(1.0)
+            val dimensionScale = minOf(
+                1.0,
+                8192.0 / maxOf(requestedWidth, requestedHeight).toDouble()
+            )
+            val scale = minOf(pixelScale, dimensionScale)
+            val renderWidth = (requestedWidth * scale).toInt().coerceAtLeast(1)
+            val renderHeight = (requestedHeight * scale).toInt().coerceAtLeast(1)
+
+            val bitmap = Bitmap.createBitmap(renderWidth, renderHeight, Bitmap.Config.ARGB_8888)
             android.graphics.Canvas(bitmap).drawColor(Color.WHITE)
             page.render(bitmap, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
             bitmap
