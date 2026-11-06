@@ -135,6 +135,9 @@ class CompanionViewModel(application: Application) : AndroidViewModel(applicatio
 
     private var activeInferenceJob: Job? = null
     private var activeIngestionJob: Job? = null
+    private var messagesCollectionJob: Job? = null
+    private var bookmarkCollectionJob: Job? = null
+    private var pdfAssistantJob: Job? = null
 
     init {
         viewModelScope.launch {
@@ -205,7 +208,8 @@ class CompanionViewModel(application: Application) : AndroidViewModel(applicatio
     }
 
     private fun loadMessagesForConversation(conversationId: Long) {
-        viewModelScope.launch {
+        messagesCollectionJob?.cancel()
+        messagesCollectionJob = viewModelScope.launch {
             messageDao.getMessagesForConversation(conversationId).collect { msgs ->
                 _currentMessages.value = msgs
             }
@@ -431,6 +435,7 @@ class CompanionViewModel(application: Application) : AndroidViewModel(applicatio
 
     // --- PDF / Document Reader ---
     fun openDocumentInReader(document: DocumentEntity) {
+        bookmarkCollectionJob?.cancel()
         viewModelScope.launch {
             _activeReaderDocument.value = document
             _readerCurrentPage.value = document.lastReadPage
@@ -445,6 +450,8 @@ class CompanionViewModel(application: Application) : AndroidViewModel(applicatio
                 }
             }
 
+        }
+        bookmarkCollectionJob = viewModelScope.launch {
             bookmarkDao.getBookmarksForDocument(document.id).collect { bookmarks ->
                 _readerBookmarks.value = bookmarks
             }
@@ -495,44 +502,49 @@ class CompanionViewModel(application: Application) : AndroidViewModel(applicatio
     // --- AI PDF Assistant inside Document Reader ---
     fun askAiAboutCurrentDocument(prompt: String) {
         val doc = _activeReaderDocument.value ?: return
-        viewModelScope.launch {
+        pdfAssistantJob?.cancel()
+        pdfAssistantJob = viewModelScope.launch {
             _pdfAssistantLoading.value = true
             _pdfAssistantResponse.value = ""
+            try {
+                // Keep source excerpts tied to their actual page numbers. When
+                // the current page has no indexed chunks, use document excerpts
+                // but never label them as belonging to the current page.
+                val docChunks = knowledgeDao.getChunksForDocument(doc.id)
+                val currentPage = _readerCurrentPage.value
+                val pageChunks = docChunks.filter { it.pageNumber == currentPage }
+                val contextChunks = (if (pageChunks.isNotEmpty()) pageChunks else docChunks)
+                    .take(4)
+                val citations = contextChunks.map { chunk ->
+                    Citation(
+                        documentTitle = doc.title,
+                        pageNumber = chunk.pageNumber,
+                        timestampSeconds = chunk.timestampSeconds,
+                        snippet = chunk.content.take(800)
+                    )
+                }
 
-            // Retrieve chunks for this specific document
-            val docChunks = knowledgeDao.getChunksForDocument(doc.id)
-            val pageChunks = docChunks.filter { it.pageNumber == _readerCurrentPage.value }
-            val contextText = if (pageChunks.isNotEmpty()) {
-                pageChunks.joinToString("\n") { it.content }
-            } else {
-                docChunks.take(4).joinToString("\n") { it.content }
+                val full = StringBuilder()
+                aiEngine.streamResponse(
+                    userPrompt = prompt,
+                    systemPrompt = "You are a built-in AI PDF reader companion analyzing ${doc.title} at page $currentPage. Ground answers in supplied excerpts; if no excerpts are supplied, say the selected page has no indexed text.",
+                    recentHistory = emptyList(),
+                    relevantMemories = listOf("Document: ${doc.title}"),
+                    relevantCitations = citations,
+                    personality = personalityEngine.traits.value,
+                    emotion = personalityEngine.emotion.value,
+                    language = _languageMode.value
+                ).collect { token ->
+                    full.append(token)
+                    _pdfAssistantResponse.value = full.toString()
+                }
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: Exception) {
+                _pdfAssistantResponse.value = "Error: ${error.message ?: "Local PDF assistant failed."}"
+            } finally {
+                _pdfAssistantLoading.value = false
             }
-
-            val citations = listOf(
-                Citation(
-                    documentTitle = doc.title,
-                    pageNumber = _readerCurrentPage.value,
-                    snippet = contextText.take(150)
-                )
-            )
-
-            val full = StringBuilder()
-            aiEngine.streamResponse(
-                userPrompt = prompt,
-                systemPrompt = "You are a built-in AI PDF reader companion analyzing ${doc.title} at page ${_readerCurrentPage.value}.",
-                recentHistory = emptyList(),
-                relevantMemories = listOf("Document: ${doc.title}"),
-                relevantCitations = citations,
-                personality = personalityEngine.traits.value,
-                emotion = personalityEngine.emotion.value,
-                language = _languageMode.value
-            ).catch { e ->
-                _pdfAssistantResponse.value = "Error: ${e.message}"
-            }.collect { token ->
-                full.append(token)
-                _pdfAssistantResponse.value = full.toString()
-            }
-            _pdfAssistantLoading.value = false
         }
     }
 
