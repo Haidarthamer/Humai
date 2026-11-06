@@ -246,7 +246,19 @@ class ModelManager(private val context: Context) {
     }
 
     fun updateContextWindow(size: Int) {
-        _contextWindow.value = size.coerceIn(1024, 8192)
+        val updatedSize = size.coerceIn(1024, 8192)
+        if (updatedSize == _contextWindow.value) return
+
+        _contextWindow.value = updatedSize
+        if (llamaBridge.isModelLoaded) {
+            // The native context size is fixed at model-load time. Unload once;
+            // the next model selection applies the new context window.
+            llamaBridge.unloadModel()
+            refreshModelCatalogFlagsOnly()
+            _modelLoadState.value = ModelLoadState.READY_TO_LOAD
+            _modelStatusDetail.value =
+                "Context window changed to $updatedSize. Select the active model again to reload with this setting."
+        }
     }
 
     fun setGpuAcceleration(enabled: Boolean) {
