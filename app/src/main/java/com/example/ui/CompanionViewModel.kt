@@ -156,7 +156,7 @@ class CompanionViewModel(application: Application) : AndroidViewModel(applicatio
                 MessageEntity(
                     conversationId = id,
                     isUser = false,
-                    content = "Hello! I am your private, offline COMPANION AI. All my thinking, learning, and long-term memories run 100% on your device.\n\nYou can talk with me, ask questions in English or Arabic (including Iraqi Arabic), or import your PDFs, videos, and notes in the Learn tab so I can learn from them!",
+                    content = "Hello! I am COMPANION AI. Chat generation runs locally after you import and load a compatible GGUF text model in Brain.\n\nI can index selectable-text PDFs, DOCX, TXT, Markdown, and notes. Image understanding, audio transcription, and video analysis are not available in this build yet. Conversations and memories are stored in the app on this device.",
                     emotionTag = "CURIOSITY"
                 )
             )
@@ -364,35 +364,50 @@ class CompanionViewModel(application: Application) : AndroidViewModel(applicatio
                 fileName = fileName
             )
 
-            when (fileType) {
-                FileType.PDF, FileType.TXT, FileType.DOCX, FileType.MARKDOWN, FileType.NOTE -> {
-                    documentIngestor.ingestDocument(
-                        uri = uri,
-                        fileName = fileName,
-                        fileType = fileType,
-                        language = _languageMode.value
-                    ) { prog, status ->
-                        _ingestionState.value = IngestionProgressState(true, prog, status, fileName)
-                    }
+            try {
+                val documentId = when (fileType) {
+                    FileType.PDF, FileType.TXT, FileType.DOCX, FileType.MARKDOWN, FileType.NOTE ->
+                        documentIngestor.ingestDocument(uri, fileName, fileType, _languageMode.value) { progress, status ->
+                            _ingestionState.value = IngestionProgressState(true, progress, status, fileName)
+                        }
+                    FileType.VIDEO ->
+                        mediaIngestor.ingestVideo(uri, fileName, _languageMode.value) { progress, status ->
+                            _ingestionState.value = IngestionProgressState(true, progress, status, fileName)
+                        }
+                    FileType.IMAGE ->
+                        mediaIngestor.ingestImage(uri, fileName, _languageMode.value) { progress, status ->
+                            _ingestionState.value = IngestionProgressState(true, progress, status, fileName)
+                        }
+                    FileType.AUDIO ->
+                        mediaIngestor.ingestAudio(uri, fileName, _languageMode.value) { progress, status ->
+                            _ingestionState.value = IngestionProgressState(true, progress, status, fileName)
+                        }
                 }
-                FileType.VIDEO -> {
-                    mediaIngestor.ingestVideo(uri, fileName, _languageMode.value) { prog, status ->
-                        _ingestionState.value = IngestionProgressState(true, prog, status, fileName)
-                    }
-                }
-                FileType.IMAGE -> {
-                    mediaIngestor.ingestImage(uri, fileName, _languageMode.value) { prog, status ->
-                        _ingestionState.value = IngestionProgressState(true, prog, status, fileName)
-                    }
-                }
-                FileType.AUDIO -> {
-                    mediaIngestor.ingestAudio(uri, fileName, _languageMode.value) { prog, status ->
-                        _ingestionState.value = IngestionProgressState(true, prog, status, fileName)
-                    }
-                }
-            }
 
-            _ingestionState.value = IngestionProgressState(isIngesting = false, progress = 1.0f, statusText = "Ready")
+                val document = documentDao.getDocumentById(documentId)
+                _ingestionState.value = if (document?.status?.name == "COMPLETED") {
+                    IngestionProgressState(
+                        isIngesting = false,
+                        progress = 1.0f,
+                        statusText = "Imported and indexed successfully.",
+                        fileName = fileName
+                    )
+                } else {
+                    IngestionProgressState(
+                        isIngesting = false,
+                        progress = 0f,
+                        statusText = document?.summary ?: "Import failed. The selected local media engine is unavailable.",
+                        fileName = fileName
+                    )
+                }
+            } catch (error: Exception) {
+                _ingestionState.value = IngestionProgressState(
+                    isIngesting = false,
+                    progress = 0f,
+                    statusText = "Import failed: " + (error.message ?: "Unknown error"),
+                    fileName = fileName
+                )
+            }
         }
     }
 
