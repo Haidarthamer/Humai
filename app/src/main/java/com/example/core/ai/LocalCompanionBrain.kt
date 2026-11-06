@@ -43,6 +43,7 @@ class LocalCompanionBrain(
                 isArabic -> append("Language Mode: Modern Standard Arabic (العربية الفصحى). Speak articulate, eloquent Arabic.\n")
                 else -> append("Language Mode: English. Be articulate, supportive, and informative.\n")
             }
+            if (systemPrompt.isNotBlank()) append("Additional system instructions: ").append(systemPrompt).append("\n")
             append("Personality Configuration:\n")
             append("- Communication Style: ${personality.communicationStyle.label}\n")
             append("- Humor: ${(personality.humor * 100).toInt()}%, Curiosity: ${(personality.curiosity * 100).toInt()}%\n")
@@ -99,23 +100,48 @@ class LocalCompanionBrain(
 
     override suspend fun generateSummary(text: String, language: LanguageMode): String {
         val clean = text.trim()
-        val sentences = try {
-            TextStreamHelper.splitIntoSentences(clean)
-        } catch (e: Exception) {
-            clean.lines().filter { it.isNotBlank() }
+        if (clean.isBlank()) return when (language) {
+            LanguageMode.ENGLISH -> "No extractable text was found."
+            LanguageMode.ARABIC_MSA -> "لم يتم العثور على نص قابل للاستخراج."
+            LanguageMode.ARABIC_IRAQI -> "ما لگيت نص قابل للاستخراج بالملف."
         }
-        val preview = sentences.take(4).joinToString(" ").take(300)
 
-        return when (language) {
-            LanguageMode.ENGLISH -> {
-                "Qwen Summary: ${if (preview.isNotBlank()) preview else "Comprehensive document covering key principles and methodologies."}"
+        if (!modelManager.llamaBridge.isModelLoaded) return when (language) {
+            LanguageMode.ENGLISH -> "Summary unavailable: load a local GGUF model to generate it."
+            LanguageMode.ARABIC_MSA -> "الملخص غير متاح: حمّل نموذج GGUF محلياً لإنشائه."
+            LanguageMode.ARABIC_IRAQI -> "الملخص مو متاح هسه؛ حمّل موديل GGUF محلي حتى ينولد."
+        }
+
+        val instruction = when (language) {
+            LanguageMode.ENGLISH -> "Create a concise, factual summary of the supplied document. Do not add facts that are not present in the source. Preserve important names, dates, definitions and conclusions."
+            LanguageMode.ARABIC_MSA -> "أنشئ ملخصاً دقيقاً وموجزاً للوثيقة. لا تضف معلومات غير موجودة في النص، وحافظ على الأسماء والتواريخ والتعريفات والاستنتاجات المهمة."
+            LanguageMode.ARABIC_IRAQI -> "سوّي ملخص واضح ودقيق للمستند. لا تضيف معلومات من عندك مو موجودة بالنص، وحافظ على الأسماء والتواريخ والتعاريف والنتائج المهمة."
+        }
+        val prompt = QwenTokenizer.formatChatML(
+            systemPrompt = "You are a careful offline document summarizer. Ground every statement in the provided source.",
+            recentHistory = emptyList(),
+            userMessage = instruction + "\n\nSOURCE DOCUMENT:\n" + clean.take(12000),
+            relevantMemories = emptyList(),
+            citations = emptyList()
+        )
+
+        val output = StringBuilder()
+        return try {
+            modelManager.llamaBridge.streamTokens(
+                formattedPrompt = prompt,
+                temperature = 0.2f,
+                maxTokens = 256,
+                isCancelled = AtomicBoolean(false)
+            ).collect { output.append(it) }
+            output.toString().trim().ifBlank {
+                when (language) {
+                    LanguageMode.ENGLISH -> "The local model returned an empty summary."
+                    LanguageMode.ARABIC_MSA -> "أعاد النموذج المحلي ملخصاً فارغاً."
+                    LanguageMode.ARABIC_IRAQI -> "الموديل رجّع ملخص فارغ."
+                }
             }
-            LanguageMode.ARABIC_MSA -> {
-                "ملخص Qwen: ${if (preview.isNotBlank()) preview else "وثيقة شاملة تغطي المفاهيم الأساسية والمنهجيات المستخلصة."}"
-            }
-            LanguageMode.ARABIC_IRAQI -> {
-                "ملخص Qwen السريع: ${if (preview.isNotBlank()) preview else "هذا الملف بيه معلومات وشروحات عن الموضوع بصورة مفصلة."}"
-            }
+        } catch (error: ModelNotLoadedException) {
+            "Summary unavailable: ${error.message ?: "local inference failed"}"
         }
     }
 
