@@ -250,11 +250,13 @@ class ModelManager(private val context: Context) {
         if (updatedSize == _contextWindow.value) return
 
         _contextWindow.value = updatedSize
-        if (llamaBridge.isModelLoaded) {
+        if (_activeModel.value != null) {
             // The native context size is fixed at model-load time. Unload once;
             // the next model selection applies the new context window.
-            llamaBridge.unloadModel()
-            refreshModelCatalogFlagsOnly()
+            if (llamaBridge.isModelLoaded) {
+                llamaBridge.unloadModel()
+                refreshModelCatalogFlagsOnly()
+            }
             _modelLoadState.value = ModelLoadState.READY_TO_LOAD
             _modelStatusDetail.value =
                 "Context window changed to $updatedSize. Select the active model again to reload with this setting."
