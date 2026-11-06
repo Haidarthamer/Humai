@@ -2,7 +2,6 @@ package com.example.core.ai
 
 import android.util.Log
 import kotlinx.coroutines.CancellationException
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
 import java.io.File
@@ -11,8 +10,11 @@ import java.util.concurrent.atomic.AtomicBoolean
 class ModelNotLoadedException(message: String) : Exception(message)
 
 /**
- * Native JNI bridge and inference manager for llama.cpp GGUF local models.
- * Optimized for Qualcomm Snapdragon 8 Gen 3 (6 threads, Adreno GPU offload).
+ * Fail-closed JNI boundary for local GGUF inference.
+ *
+ * A valid GGUF header is not proof that a model is resident in memory. The
+ * native backend must return a non-zero handle before this class reports a
+ * successful load or emits any generated text.
  */
 class LlamaBridge {
 
@@ -24,10 +26,10 @@ class LlamaBridge {
             try {
                 System.loadLibrary("llama-android")
                 isLibraryLoaded = true
-                Log.i(TAG, "libllama-android.so native library loaded successfully.")
-            } catch (e: UnsatisfiedLinkError) {
+                Log.i(TAG, "Native llama library loaded.")
+            } catch (error: UnsatisfiedLinkError) {
                 isLibraryLoaded = false
-                Log.i(TAG, "libllama-android.so runtime binary not bundled in APK assets: ${e.message}")
+                Log.w(TAG, "Native llama backend is not packaged: ${error.message}")
             }
         }
 
@@ -40,7 +42,7 @@ class LlamaBridge {
     private var modelMetadata: GGUFMetadata? = null
 
     val isModelLoaded: Boolean
-        get() = modelPointer != 0L || (loadedModelPath != null && File(loadedModelPath ?: "").exists())
+        get() = isLibraryLoaded && modelPointer != 0L && contextPointer != 0L
 
     val currentModelPath: String?
         get() = loadedModelPath
@@ -48,62 +50,76 @@ class LlamaBridge {
     val currentMetadata: GGUFMetadata?
         get() = modelMetadata
 
-    /**
-     * Loads a GGUF model into memory.
-     * @param modelFile the local .gguf file
-     * @param nGpuLayers number of layers to offload to Adreno 750 GPU (default 28 for Snapdragon 8 Gen 3)
-     * @param contextSize context window length (default 4096)
-     * @param nThreads number of worker CPU threads (default 6 for Snapdragon 8 Gen 3)
-     */
+    @Synchronized
     fun loadModel(
         modelFile: File,
-        nGpuLayers: Int = 28,
+        nGpuLayers: Int = 0,
         contextSize: Int = 4096,
-        nThreads: Int = 6
+        nThreads: Int = Runtime.getRuntime().availableProcessors().coerceIn(2, 6)
     ): Result<GGUFMetadata> {
-        if (!modelFile.exists()) {
+        if (!modelFile.isFile || !modelFile.canRead()) {
             return Result.failure(
-                ModelNotLoadedException(
-                    "Model file '${modelFile.name}' not found on device storage (${modelFile.absolutePath}). " +
-                            "Please place or import the Qwen3-4B GGUF file in Brain Manager."
-                )
+                ModelNotLoadedException("Model file is missing or unreadable: ${modelFile.absolutePath}")
             )
         }
 
-        // Parse and validate GGUF headers
         val meta = GGUFParser.parse(modelFile)
         if (!meta.isValid) {
             return Result.failure(
-                ModelNotLoadedException("Invalid GGUF model binary: ${meta.errorMessage}")
+                ModelNotLoadedException("Invalid GGUF file: ${meta.errorMessage}")
+            )
+        }
+
+        if (!isLibraryLoaded) {
+            return Result.failure(
+                ModelNotLoadedException(
+                    "The GGUF file is valid, but Humai's native llama.cpp runtime is not included in this build. " +
+                        "No model was loaded and no simulated response will be generated."
+                )
             )
         }
 
         unloadModel()
 
-        if (isLibraryLoaded) {
-            try {
-                modelPointer = nativeLoadModel(modelFile.absolutePath, nGpuLayers, contextSize, nThreads)
-                if (modelPointer == 0L) {
-                    return Result.failure(ModelNotLoadedException("Native llama.cpp engine failed to initialize model."))
-                }
-            } catch (e: Exception) {
-                Log.e(TAG, "Native load failed: ${e.message}", e)
+        return try {
+            val handle = nativeLoadModel(
+                modelFile.absolutePath,
+                nGpuLayers.coerceAtLeast(0),
+                contextSize.coerceIn(512, 8192),
+                nThreads.coerceIn(1, 8)
+            )
+            if (handle == 0L) {
+                Result.failure(
+                    ModelNotLoadedException(
+                        "The native backend rejected the model. Check that this build contains a working llama.cpp implementation."
+                    )
+                )
+            } else {
+                // The current JNI contract only returns a model handle. It does
+                // not create/return a llama_context, so inference is deliberately
+                // not marked ready until that contract is implemented.
+                nativeUnloadModel(handle, 0L)
+                Result.failure(
+                    ModelNotLoadedException(
+                        "Native model loading returned a handle, but context creation is not implemented. " +
+                            "Inference is disabled rather than reporting a false success."
+                    )
+                )
             }
+        } catch (error: UnsatisfiedLinkError) {
+            Log.e(TAG, "JNI entry point missing", error)
+            Result.failure(ModelNotLoadedException("Native llama JNI entry point is missing: ${error.message}"))
+        } catch (error: Exception) {
+            Log.e(TAG, "Model load failed", error)
+            Result.failure(ModelNotLoadedException("Model load failed: ${error.message}"))
         }
-
-        loadedModelPath = modelFile.absolutePath
-        modelMetadata = meta
-        Log.i(TAG, "GGUF model '${meta.modelName}' successfully initialized (${meta.quantization}, ${meta.tensorCount} tensors, ctx: ${meta.contextLength}).")
-        return Result.success(meta)
     }
 
+    @Synchronized
     fun unloadModel() {
         if (modelPointer != 0L && isLibraryLoaded) {
-            try {
-                nativeUnloadModel(modelPointer, contextPointer)
-            } catch (e: Exception) {
-                Log.w(TAG, "Error unloading native model: ${e.message}")
-            }
+            runCatching { nativeUnloadModel(modelPointer, contextPointer) }
+                .onFailure { Log.w(TAG, "Native unload failed", it) }
         }
         modelPointer = 0L
         contextPointer = 0L
@@ -111,9 +127,6 @@ class LlamaBridge {
         modelMetadata = null
     }
 
-    /**
-     * Generates streaming tokens from the model.
-     */
     fun streamTokens(
         formattedPrompt: String,
         temperature: Float = 0.7f,
@@ -122,64 +135,43 @@ class LlamaBridge {
     ): Flow<String> = flow {
         if (!isModelLoaded) {
             throw ModelNotLoadedException(
-                "No Qwen language model is currently loaded in memory.\n" +
-                        "Please go to the Brain tab, select Qwen3-4B, and ensure the GGUF model file is present or imported."
+                "No working local inference session is loaded. Import a real GGUF model and install a build with the native llama.cpp runtime."
             )
         }
 
-        // If native library is active, run through JNI evaluation loop
-        if (isLibraryLoaded && modelPointer != 0L) {
-            try {
-                val promptTokens = nativeTokenize(modelPointer, formattedPrompt)
-                var generatedCount = 0
-
-                for (tok in promptTokens) {
-                    if (isCancelled.get()) throw CancellationException("Generation stopped by user.")
-                    nativeEval(contextPointer, tok)
-                }
-
-                while (generatedCount < maxTokens) {
-                    if (isCancelled.get()) throw CancellationException("Generation stopped by user.")
-                    val nextToken = nativeSample(contextPointer, temperature, 0.9f)
-                    if (nextToken <= 0 || nextToken == 151645) { // Qwen <|im_end|> EOS token id
-                        break
-                    }
-                    val piece = nativeTokenToPiece(modelPointer, nextToken)
-                    emit(piece)
-                    nativeEval(contextPointer, nextToken)
-                    generatedCount++
-                    delay(18)
-                }
-                return@flow
-            } catch (e: Exception) {
-                Log.w(TAG, "Native inference execution error, falling back to local decoding pipeline: ${e.message}")
+        try {
+            val promptTokens = nativeTokenize(modelPointer, formattedPrompt)
+            if (promptTokens.isEmpty()) {
+                throw ModelNotLoadedException("The native tokenizer returned no prompt tokens.")
             }
-        }
 
-        // Local deterministic decoding pipeline for GGUF model execution
-        // Generates comprehensive contextual output formatted from prompt tokens
-        val tokens = QwenTokenizer.tokenize(formattedPrompt)
-        Log.d(TAG, "Executing token decoding for ${tokens.size} input tokens...")
-
-        // Stream real decoded text response
-        val responseText = QwenResponseGenerator.generate(formattedPrompt, modelMetadata)
-        val pieces = try {
-            TextStreamHelper.splitIntoStreamPieces(responseText)
-        } catch (e: Exception) {
-            Log.w(TAG, "Streaming piece split fallback: ${e.message}")
-            responseText.split(" ").map { "$it " }
-        }
-
-        for (piece in pieces) {
-            if (isCancelled.get()) {
-                throw CancellationException("Generation stopped by user.")
+            for (token in promptTokens) {
+                if (isCancelled.get()) throw CancellationException("Generation stopped by user.")
+                if (nativeEval(contextPointer, token) != 0) {
+                    throw ModelNotLoadedException("Native prompt evaluation failed.")
+                }
             }
-            emit(piece)
-            delay(24)
+
+            var generated = 0
+            while (generated < maxTokens.coerceAtLeast(1)) {
+                if (isCancelled.get()) throw CancellationException("Generation stopped by user.")
+                val nextToken = nativeSample(contextPointer, temperature.coerceIn(0.0f, 2.0f), 0.9f)
+                if (nextToken <= 0 || nextToken == 151645) break
+
+                val piece = nativeTokenToPiece(modelPointer, nextToken)
+                if (piece.isNotEmpty()) emit(piece)
+                if (nativeEval(contextPointer, nextToken) != 0) {
+                    throw ModelNotLoadedException("Native token evaluation failed.")
+                }
+                generated++
+            }
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (error: UnsatisfiedLinkError) {
+            throw ModelNotLoadedException("Native inference function is unavailable: ${error.message}")
         }
     }
 
-    // Native JNI declarations
     private external fun nativeLoadModel(path: String, gpuLayers: Int, ctxSize: Int, threads: Int): Long
     private external fun nativeUnloadModel(modelPtr: Long, ctxPtr: Long)
     private external fun nativeEval(ctxPtr: Long, token: Int): Int
