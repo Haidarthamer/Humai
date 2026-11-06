@@ -216,88 +216,80 @@ class CompanionViewModel(application: Application) : AndroidViewModel(applicatio
 
     fun sendMessage(userText: String, imageUri: Uri? = null) {
         val imageToProcess = imageUri ?: _attachedImageUri.value
-        _attachedImageUri.value = null // clear attached image for next message
+        _attachedImageUri.value = null
 
         if (userText.isBlank() && imageToProcess == null) return
+        // Set this synchronously, before scheduling work, to reject rapid duplicate sends.
         if (_isGenerating.value) return
+        _isGenerating.value = true
+        _streamingMessageText.value = ""
         val convId = _currentConversationId.value ?: 1L
 
-        viewModelScope.launch {
-            // Save user message with optional attached image
-            messageDao.insertMessage(
-                MessageEntity(
-                    conversationId = convId,
-                    isUser = true,
-                    content = userText.trim().ifBlank { "[Attached Image]" },
-                    imageUri = imageToProcess?.toString()
+        activeInferenceJob = viewModelScope.launch {
+            try {
+                messageDao.insertMessage(
+                    MessageEntity(
+                        conversationId = convId,
+                        isUser = true,
+                        content = userText.trim().ifBlank { "[Attached Image]" },
+                        imageUri = imageToProcess?.toString()
+                    )
                 )
-            )
 
-            // Trigger dynamic personality evolution
-            personalityEngine.processDialogueEvolution(userText)
+                personalityEngine.processDialogueEvolution(userText)
 
-            var imagePrompt: String? = null
-            if (imageToProcess != null) {
-                _streamingMessageText.value = ""
-                try {
-                    val analysis = visionEngine.analyzeImage(imageToProcess)
-                    imagePrompt = analysis.sceneDescription
-                } catch (error: Exception) {
-                    val message = when (_languageMode.value) {
-                        LanguageMode.ARABIC_IRAQI -> "تحليل الصور المحلي مو مفعّل بهذي النسخة بعد. ما راح أخمّن محتوى الصورة؛ استورد نص أو استخدم المحادثة بدون مرفق حالياً."
-                        LanguageMode.ARABIC_MSA -> "تحليل الصور المحلي غير متاح في هذا الإصدار. لن أخمّن محتوى الصورة."
-                        LanguageMode.ENGLISH -> "Local image understanding is not available in this build. I won't guess what the image contains."
+                var imagePrompt: String? = null
+                if (imageToProcess != null) {
+                    val analysis = try {
+                        visionEngine.analyzeImage(imageToProcess)
+                    } catch (error: Exception) {
+                        val message = when (_languageMode.value) {
+                            LanguageMode.ARABIC_IRAQI -> "تحليل الصور المحلي مو مفعّل بهذي النسخة بعد. ما راح أخمّن محتوى الصورة؛ جرّب المحادثة بدون مرفق حالياً."
+                            LanguageMode.ARABIC_MSA -> "تحليل الصور المحلي غير متاح في هذا الإصدار. لن أخمّن محتوى الصورة."
+                            LanguageMode.ENGLISH -> "Local image understanding is not available in this build. I won't guess what the image contains."
+                        }
+                        messageDao.insertMessage(
+                            MessageEntity(
+                                conversationId = convId,
+                                isUser = false,
+                                content = message,
+                                emotionTag = "CONFUSION"
+                            )
+                        )
+                        return@launch
                     }
-                    messageDao.insertMessage(
-                        MessageEntity(
-                            conversationId = convId,
-                            isUser = false,
-                            content = message,
-                            emotionTag = "CONFUSION"
-                        )
-                    )
-                    _streamingMessageText.value = ""
-                    _isGenerating.value = false
-                    return@launch
+                    imagePrompt = analysis.sceneDescription
                 }
-            }
 
-            // Run retrieval away from Main. Large local libraries must not block UI rendering.
-            val scoredCitations = withContext(Dispatchers.IO) {
-                val queryTokens = LocalEmbeddingEngine.tokenize(userText)
-                val candidateChunks = knowledgeDao.getAllChunks()
-                candidateChunks.mapNotNull { chunk ->
-                    val bm25 = LocalEmbeddingEngine.computeBm25Score(
-                        queryTokens,
-                        LocalEmbeddingEngine.tokenize(chunk.content)
+                // Corpus-aware BM25 search runs off the UI thread. We only pass
+                // the highest-ranking excerpts to the model, never the whole library.
+                val scoredCitations = withContext(Dispatchers.IO) {
+                    val candidateChunks = knowledgeDao.getAllChunks()
+                    val ranked = LocalEmbeddingEngine.rankByBm25(
+                        query = userText,
+                        documents = candidateChunks,
+                        textOf = { it.content },
+                        limit = 3
                     )
-                    if (bm25 > 0f) {
-                        val doc = documentDao.getDocumentById(chunk.documentId)
-                        val title = doc?.title ?: "Document #${chunk.documentId}"
-                        Pair(
-                            Citation(
-                                documentTitle = title,
-                                pageNumber = chunk.pageNumber,
-                                timestampSeconds = chunk.timestampSeconds,
-                                snippet = chunk.content
-                            ),
-                            bm25
+                    val titles = ranked.map { it.first.documentId }.distinct().associateWith { id ->
+                        documentDao.getDocumentById(id)?.title ?: "Document #$id"
+                    }
+                    ranked.map { (chunk, _) ->
+                        Citation(
+                            documentTitle = titles[chunk.documentId] ?: "Document #${chunk.documentId}",
+                            pageNumber = chunk.pageNumber,
+                            timestampSeconds = chunk.timestampSeconds,
+                            snippet = chunk.content.take(800)
                         )
-                    } else null
-                }.sortedByDescending { it.second }.take(3).map { it.first }
-            }
+                    }
+                }
 
-            val relevantMemories = withContext(Dispatchers.IO) {
-                memoryManager.retrieveRelevantMemories(userText, maxCount = 2)
-                    .map { "${it.topic}: ${it.content}" }
-            }
+                val relevantMemories = withContext(Dispatchers.IO) {
+                    memoryManager.retrieveRelevantMemories(userText, maxCount = 2)
+                        .map { "${it.topic}: ${it.content}" }
+                }
 
-            _isGenerating.value = true
-            _streamingMessageText.value = ""
-
-            val history = _currentMessages.value.takeLast(6).map { it.isUser to it.content }
-
-            activeInferenceJob = launch {
+                val history = _currentMessages.value.takeLast(6).map { it.isUser to it.content }
                 val fullAccumulator = StringBuilder()
                 aiEngine.streamResponse(
                     userPrompt = userText,
@@ -310,37 +302,38 @@ class CompanionViewModel(application: Application) : AndroidViewModel(applicatio
                     language = _languageMode.value,
                     temperature = modelManager.temperature.value,
                     imagePrompt = imagePrompt
-                ).catch { e ->
-                    val err = "\n[Qwen Engine Error: ${e.message ?: "Model execution failed"}]"
-                    fullAccumulator.append(err)
+                ).catch { error ->
+                    fullAccumulator.append("\n[Local AI error: ${error.message ?: "Model execution failed"}]")
                     _streamingMessageText.value = fullAccumulator.toString()
                 }.collect { token ->
                     fullAccumulator.append(token)
                     _streamingMessageText.value = fullAccumulator.toString()
                 }
 
-                // Completed generation: save assistant message
                 val finalContent = fullAccumulator.toString().trim()
-                if (finalContent.isNotEmpty()) {
-                    messageDao.insertMessage(
-                        MessageEntity(
-                            conversationId = convId,
-                            isUser = false,
-                            content = finalContent,
-                            emotionTag = personalityEngine.emotion.value.current.name
-                        )
-                    )
-                } else {
-                    val fallbackError = "[Qwen3-4B Inference]: No tokens were generated. Please check model status in Brain Manager."
-                    messageDao.insertMessage(
-                        MessageEntity(
-                            conversationId = convId,
-                            isUser = false,
-                            content = fallbackError,
-                            emotionTag = "CONFUSION"
-                        )
-                    )
+                val assistantContent = finalContent.ifBlank {
+                    "[Local model returned no tokens. Check Brain Manager and model status.]"
                 }
+                messageDao.insertMessage(
+                    MessageEntity(
+                        conversationId = convId,
+                        isUser = false,
+                        content = assistantContent,
+                        emotionTag = personalityEngine.emotion.value.current.name
+                    )
+                )
+            } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                throw cancelled
+            } catch (error: Exception) {
+                messageDao.insertMessage(
+                    MessageEntity(
+                        conversationId = convId,
+                        isUser = false,
+                        content = "Local processing failed: ${error.message ?: "Unknown error"}",
+                        emotionTag = "CONFUSION"
+                    )
+                )
+            } finally {
                 _streamingMessageText.value = ""
                 _isGenerating.value = false
             }
