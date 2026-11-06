@@ -147,6 +147,33 @@ fun BrainScreen(
         }
     }
 
+    val whisperModelPicker = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenDocument()
+    ) { uri: Uri? ->
+        uri?.let { selectedUri ->
+            importScope.launch {
+                try {
+                    val destination = withContext(Dispatchers.IO) {
+                        val modelsDir = File(context.filesDir, "models").apply { mkdirs() }
+                        val input = context.contentResolver.openInputStream(selectedUri)
+                            ?: throw IllegalArgumentException("Cannot open selected Whisper model.")
+                        val outputFile = File(modelsDir, "ggml-base.bin")
+                        input.use { source ->
+                            FileOutputStream(outputFile).use { output -> source.copyTo(output) }
+                        }
+                        require(outputFile.length() > 10L * 1024L * 1024L) {
+                            "The selected file is too small to be a real Whisper model."
+                        }
+                        outputFile
+                    }
+                    Toast.makeText(context, "Whisper model imported (${destination.length() / (1024 * 1024)} MB).", Toast.LENGTH_LONG).show()
+                } catch (error: Exception) {
+                    Toast.makeText(context, "Whisper import failed: ${error.message}", Toast.LENGTH_LONG).show()
+                }
+            }
+        }
+    }
+
     Column(
         modifier = modifier
             .fillMaxSize()
@@ -325,6 +352,22 @@ fun BrainScreen(
                 Spacer(modifier = Modifier.width(4.dp))
                 Text(if (isArabic) "استيراد" else "Import", color = CompanionCyan, fontSize = 11.sp)
             }
+        }
+
+        Spacer(modifier = Modifier.height(8.dp))
+
+        Button(
+            onClick = { whisperModelPicker.launch(arrayOf("application/octet-stream", "application/x-binary", "*/*")) },
+            colors = ButtonDefaults.buttonColors(containerColor = CompanionSurfaceVariant),
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Icon(Icons.Default.FileUpload, contentDescription = null, tint = CompanionCyan)
+            Spacer(modifier = Modifier.width(8.dp))
+            Text(
+                if (isArabic) "استيراد موديل Whisper للصوت (.bin)" else "Import Whisper speech model (.bin)",
+                color = CompanionCyanBright,
+                fontSize = 11.sp
+            )
         }
 
         Spacer(modifier = Modifier.height(8.dp))
