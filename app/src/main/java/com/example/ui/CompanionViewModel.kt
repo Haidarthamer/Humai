@@ -216,11 +216,11 @@ class CompanionViewModel(application: Application) : AndroidViewModel(applicatio
 
     fun sendMessage(userText: String, imageUri: Uri? = null) {
         val imageToProcess = imageUri ?: _attachedImageUri.value
-        _attachedImageUri.value = null
-
         if (userText.isBlank() && imageToProcess == null) return
-        // Set this synchronously, before scheduling work, to reject rapid duplicate sends.
+        // Preserve the attachment when a previous generation is still active.
         if (_isGenerating.value) return
+        _attachedImageUri.value = null
+        // Set this synchronously, before scheduling work, to reject rapid duplicate sends.
         _isGenerating.value = true
         _streamingMessageText.value = ""
         val convId = _currentConversationId.value ?: 1L
