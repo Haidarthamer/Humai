@@ -90,7 +90,7 @@ class ModelManager(private val context: Context) {
         val isSnapdragon8Gen3 = Build.VERSION.SDK_INT >= 31 && Build.SOC_MODEL.contains("8650", ignoreCase = true)
 
         return HardwareReport(
-            deviceName = if (isSnapdragon8Gen3) "$deviceName (Snapdragon 8 Gen 3 / 12GB)" else deviceName,
+            deviceName = if (isSnapdragon8Gen3) "$deviceName (Snapdragon 8 Gen 3)" else deviceName,
             processorName = if (isSnapdragon8Gen3) "Qualcomm Snapdragon 8 Gen 3 (Adreno 750 GPU)" else "ARM64 Octa-Core",
             totalRamMb = totalRamMb,
             availableRamMb = availRamMb,
@@ -207,6 +207,13 @@ class ModelManager(private val context: Context) {
     }
 
     fun selectModel(model: GGUFModelInfo) {
+        if (model.modelRole == com.example.core.model.ModelRole.VISION_MULTIMODAL ||
+            model.modelRole == com.example.core.model.ModelRole.VISION_PROJECTOR
+        ) {
+            _modelLoadState.value = ModelLoadState.ERROR
+            _modelStatusDetail.value = "Vision inference is not integrated in this build; this file cannot be selected as a text model."
+            return
+        }
         _activeModel.value = model
         loadSelectedModel(model)
         refreshModelCatalog()
