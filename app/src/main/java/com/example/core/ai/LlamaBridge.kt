@@ -4,6 +4,8 @@ import android.util.Log
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import java.io.File
 import java.util.concurrent.atomic.AtomicBoolean
 
@@ -26,6 +28,7 @@ class LlamaBridge {
         fun isNativeAvailable(): Boolean = isLibraryLoaded
     }
 
+    private val inferenceMutex = Mutex()
     private var modelPointer: Long = 0L
     private var contextPointer: Long = 0L
     private var loadedModelPath: String? = null
@@ -36,7 +39,6 @@ class LlamaBridge {
     val currentModelPath: String? get() = loadedModelPath
     val currentMetadata: GGUFMetadata? get() = modelMetadata
 
-    @Synchronized
     fun loadModel(
         modelFile: File,
         nGpuLayers: Int = 0,
@@ -56,9 +58,12 @@ class LlamaBridge {
         if (!isLibraryLoaded) {
             return Result.failure(ModelNotLoadedException("The llama.cpp native runtime is missing from this APK. Build the CMake target before loading a model."))
         }
+        if (!inferenceMutex.tryLock()) {
+            return Result.failure(ModelNotLoadedException("The local model is busy generating a response. Try loading the model again after generation finishes."))
+        }
 
-        unloadModel()
-        return try {
+        try {
+            releaseSession()
             val session = nativeLoadModel(
                 modelFile.absolutePath,
                 nGpuLayers.coerceAtLeast(0),
@@ -66,27 +71,39 @@ class LlamaBridge {
                 nThreads.coerceIn(1, 8)
             )
             if (session == 0L) {
-                Result.failure(ModelNotLoadedException("llama.cpp failed to load the model or create its inference context. Check Logcat for native details."))
-            } else {
-                // The native pointer owns model + context + sampler + batch.
-                modelPointer = session
-                contextPointer = session
-                loadedModelPath = modelFile.absolutePath
-                modelMetadata = metadata
-                Log.i(TAG, "Loaded ${metadata.modelName} with a real llama.cpp context.")
-                Result.success(metadata)
+                return Result.failure(ModelNotLoadedException("llama.cpp failed to load the model or create its inference context. Check Logcat for native details."))
             }
+
+            modelPointer = session
+            contextPointer = session
+            loadedModelPath = modelFile.absolutePath
+            modelMetadata = metadata
+            Log.i(TAG, "Loaded ${metadata.modelName} with a real llama.cpp context.")
+            return Result.success(metadata)
         } catch (error: UnsatisfiedLinkError) {
-            unloadModel()
-            Result.failure(ModelNotLoadedException("Missing native llama.cpp JNI function: ${error.message}"))
+            releaseSession()
+            return Result.failure(ModelNotLoadedException("Missing native llama.cpp JNI function: ${error.message}"))
         } catch (error: Exception) {
-            unloadModel()
-            Result.failure(ModelNotLoadedException("Model load failed: ${error.message}"))
+            releaseSession()
+            return Result.failure(ModelNotLoadedException("Model load failed: ${error.message}"))
+        } finally {
+            inferenceMutex.unlock()
         }
     }
 
-    @Synchronized
     fun unloadModel() {
+        if (!inferenceMutex.tryLock()) {
+            Log.w(TAG, "Model unload skipped because an inference operation is active.")
+            return
+        }
+        try {
+            releaseSession()
+        } finally {
+            inferenceMutex.unlock()
+        }
+    }
+
+    private fun releaseSession() {
         val handle = modelPointer
         modelPointer = 0L
         contextPointer = 0L
@@ -107,6 +124,7 @@ class LlamaBridge {
         maxTokens: Int = 1024,
         isCancelled: AtomicBoolean
     ): Flow<String> = flow {
+        inferenceMutex.withLock {
         if (!isModelLoaded) throw ModelNotLoadedException("No real local llama.cpp inference session is loaded.")
         val handle = contextPointer
 
@@ -145,6 +163,7 @@ class LlamaBridge {
             throw cancelled
         } catch (error: UnsatisfiedLinkError) {
             throw ModelNotLoadedException("Native inference function unavailable: ${error.message}")
+        }
         }
     }
 
