@@ -564,7 +564,10 @@ class CompanionViewModel(application: Application) : AndroidViewModel(applicatio
     }
 
     fun selectModel(model: GGUFModelInfo) {
-        modelManager.selectModel(model)
+        // Loading multi-gigabyte GGUF weights is blocking native work; keep it off Main.
+        viewModelScope.launch(Dispatchers.IO) {
+            modelManager.selectModel(model)
+        }
     }
 
     fun retryModelProvisioning() {
