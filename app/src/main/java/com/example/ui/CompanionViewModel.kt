@@ -28,6 +28,8 @@ import com.example.database.entities.DocumentEntity
 import com.example.database.entities.MemoryEntity
 import com.example.database.entities.MessageEntity
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
@@ -260,37 +262,35 @@ class CompanionViewModel(application: Application) : AndroidViewModel(applicatio
                 }
             }
 
-            // Perform Hybrid RAG Search across local Knowledge Chunks
-            val queryVector = LocalEmbeddingEngine.generateEmbedding(userText)
-            val queryTokens = LocalEmbeddingEngine.tokenize(userText)
-
-            val candidateChunks = knowledgeDao.getAllChunks()
-            val scoredCitations = candidateChunks.mapNotNull { chunk ->
-                val chunkVector = LocalEmbeddingEngine.stringToVector(chunk.embeddingVectorStr)
-                val cosine = LocalEmbeddingEngine.cosineSimilarity(queryVector, chunkVector)
-                val bm25 = LocalEmbeddingEngine.computeBm25Score(
-                    queryTokens,
-                    LocalEmbeddingEngine.tokenize(chunk.content)
-                )
-                val score = (cosine * 0.5f) + ((bm25 / 4f).coerceIn(0f, 0.5f))
-                if (score > 0.12f) {
-                    val doc = documentDao.getDocumentById(chunk.documentId)
-                    val title = doc?.title ?: "Document #${chunk.documentId}"
-                    Pair(
-                        Citation(
-                            documentTitle = title,
-                            pageNumber = chunk.pageNumber,
-                            timestampSeconds = chunk.timestampSeconds,
-                            snippet = chunk.content
-                        ),
-                        score
+            // Run retrieval away from Main. Large local libraries must not block UI rendering.
+            val scoredCitations = withContext(Dispatchers.IO) {
+                val queryTokens = LocalEmbeddingEngine.tokenize(userText)
+                val candidateChunks = knowledgeDao.getAllChunks()
+                candidateChunks.mapNotNull { chunk ->
+                    val bm25 = LocalEmbeddingEngine.computeBm25Score(
+                        queryTokens,
+                        LocalEmbeddingEngine.tokenize(chunk.content)
                     )
-                } else null
-            }.sortedByDescending { it.second }.take(3).map { it.first }
+                    if (bm25 > 0f) {
+                        val doc = documentDao.getDocumentById(chunk.documentId)
+                        val title = doc?.title ?: "Document #${chunk.documentId}"
+                        Pair(
+                            Citation(
+                                documentTitle = title,
+                                pageNumber = chunk.pageNumber,
+                                timestampSeconds = chunk.timestampSeconds,
+                                snippet = chunk.content
+                            ),
+                            bm25
+                        )
+                    } else null
+                }.sortedByDescending { it.second }.take(3).map { it.first }
+            }
 
-            // Retrieve relevant memories
-            val relevantMemories = memoryManager.retrieveRelevantMemories(userText, maxCount = 2)
-                .map { "${it.topic}: ${it.content}" }
+            val relevantMemories = withContext(Dispatchers.IO) {
+                memoryManager.retrieveRelevantMemories(userText, maxCount = 2)
+                    .map { "${it.topic}: ${it.content}" }
+            }
 
             _isGenerating.value = true
             _streamingMessageText.value = ""
