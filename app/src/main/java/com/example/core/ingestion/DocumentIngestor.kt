@@ -2,6 +2,7 @@ package com.example.core.ingestion
 
 import android.content.Context
 import android.net.Uri
+import android.util.Xml
 import com.example.core.ai.AiEngine
 import com.example.core.ai.LocalEmbeddingEngine
 import com.example.core.model.FileType
@@ -21,6 +22,7 @@ import kotlinx.coroutines.withContext
 import java.io.File
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.zip.ZipInputStream
+import org.xmlpull.v1.XmlPullParser
 
 class DocumentIngestor(
     private val context: Context,
@@ -83,7 +85,7 @@ class DocumentIngestor(
                     chunkTextIntoPages(text)
                 }
                 else -> {
-                    listOf(Pair(1, "Imported file: $fileName"))
+                    throw IllegalArgumentException("Unsupported document type for text ingestion: $fileType")
                 }
             }
 
@@ -130,19 +132,26 @@ class DocumentIngestor(
             onProgress(0.85f, "Persisting knowledge into local cognitive matrix...")
             knowledgeDao.insertChunks(chunks)
 
-            // Add automatic semantic memory entry
-            val memoryContent = "Learned from document '$fileName': $summary (Key concepts: ${concepts.joinToString(", ")})"
-            memoryDao.insertMemory(
-                MemoryEntity(
-                    tier = MemoryTier.SEMANTIC,
-                    topic = fileName.removeSuffix(".pdf").removeSuffix(".txt").removeSuffix(".docx"),
-                    content = memoryContent,
-                    importanceScore = 0.85f,
-                    accessCount = 1,
-                    sourceDocumentId = docId,
-                    sourceDetails = "Auto-indexed $fileName (${pagesData.size} pages)"
+            // Only write a semantic summary memory when the local model actually
+            // produced one. Do not save an error notice as if it were learned knowledge.
+            val summaryWasGenerated = summary.isNotBlank() &&
+                !summary.startsWith("Summary unavailable:", ignoreCase = true) &&
+                !summary.startsWith("الملخص غير متاح") &&
+                !summary.startsWith("الملخص مو متاح")
+            if (summaryWasGenerated) {
+                val memoryContent = "Learned from document '$fileName': $summary (Key concepts: ${concepts.joinToString(", ")})"
+                memoryDao.insertMemory(
+                    MemoryEntity(
+                        tier = MemoryTier.SEMANTIC,
+                        topic = fileName.removeSuffix(".pdf").removeSuffix(".txt").removeSuffix(".docx"),
+                        content = memoryContent,
+                        importanceScore = 0.85f,
+                        accessCount = 1,
+                        sourceDocumentId = docId,
+                        sourceDetails = "Auto-indexed $fileName (${pagesData.size} pages)"
+                    )
                 )
-            )
+            }
 
             // Update document status
             val wordCount = fullText.split(Regex("\\s+")).size
@@ -184,27 +193,47 @@ class DocumentIngestor(
     }
 
     private fun extractDocxText(file: File): String {
-        return try {
-            val sb = java.lang.StringBuilder()
-            ZipInputStream(file.inputStream()).use { zip ->
-                var entry = zip.nextEntry
-                while (entry != null) {
-                    if (entry.name == "word/document.xml") {
-                        val xmlContent = zip.reader().readText()
-                        // Strip XML tags (<w:t>...</w:t>)
-                        val textRegex = Regex("<w:t[^>]*>(.*?)</w:t>")
-                        val matches = textRegex.findAll(xmlContent)
-                        for (m in matches) {
-                            sb.append(m.groupValues[1]).append(" ")
+        require(file.isFile && file.canRead()) { "DOCX file is missing or unreadable." }
+        val output = StringBuilder()
+        var foundDocumentXml = false
+
+        ZipInputStream(file.inputStream()).use { zip ->
+            var entry = zip.nextEntry
+            while (entry != null) {
+                if (entry.name == "word/document.xml") {
+                    foundDocumentXml = true
+                    val parser = Xml.newPullParser()
+                    parser.setFeature(XmlPullParser.FEATURE_PROCESS_NAMESPACES, true)
+                    parser.setFeature(XmlPullParser.FEATURE_PROCESS_DOCDECL, false)
+                    parser.setInput(zip, "UTF-8")
+
+                    var event = parser.eventType
+                    while (event != XmlPullParser.END_DOCUMENT) {
+                        when (event) {
+                            XmlPullParser.START_TAG -> when (parser.name) {
+                                "tab" -> output.append('\t')
+                                "br" -> output.append('\n')
+                            }
+                            XmlPullParser.TEXT -> output.append(parser.text)
+                            XmlPullParser.END_TAG -> if (parser.name == "p") output.append('\n')
                         }
+                        event = parser.next()
                     }
-                    entry = zip.nextEntry
+                    break
                 }
+                zip.closeEntry()
+                entry = zip.nextEntry
             }
-            sb.toString().ifBlank { "DOCX content could not be parsed." }
-        } catch (e: Exception) {
-            "DOCX parsing fallback: ${file.nameWithoutExtension}"
         }
+
+        require(foundDocumentXml) { "This file is not a valid DOCX document (word/document.xml is missing)." }
+        val extracted = output.toString()
+            .replace('\u0000', ' ')
+            .replace(Regex("[ \\t]+"), " ")
+            .replace(Regex(" *\\n *"), "\\n")
+            .trim()
+        require(extracted.isNotBlank()) { "No selectable text was found in this DOCX file." }
+        return extracted
     }
 
     private fun chunkTextIntoPages(text: String): List<Pair<Int, String>> {
@@ -218,6 +247,7 @@ class DocumentIngestor(
             pages.add(Pair(p++, pageSlice.joinToString(" ")))
             i += wordsPerPage
         }
-        return if (pages.isEmpty()) listOf(Pair(1, text.ifBlank { "Note content" })) else pages
+        require(pages.isNotEmpty()) { "The selected document contains no extractable text." }
+        return pages
     }
 }
