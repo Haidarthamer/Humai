@@ -72,7 +72,7 @@ class MediaIngestor(
             val durationSec = (durationMs / 1000L).coerceAtLeast(1L)
 
             // Step 1: Transcribe audio using Whisper.cpp
-            onProgress(0.30f, "Transcribing speech audio with Whisper.cpp...")
+            onProgress(0.30f, "Checking local Whisper transcription runtime...")
             val isArabic = language != LanguageMode.ENGLISH
             val audioSegments = whisperEngine.transcribeAudioFile(cachedFile, isArabic)
 
@@ -100,9 +100,10 @@ class MediaIngestor(
                 // Correlate corresponding Whisper audio transcription segment
                 val audioText = audioSegments.find { sec in it.startSeconds..it.endSeconds }?.text ?: ""
                 val visualDesc = if (frameBitmap != null) {
-                    "Qwen3-VL Keyframe [${sec / 60}m:${sec % 60}s]: Visual frame extracted (${frameBitmap.width}x${frameBitmap.height}). Scene presentation and display elements."
+                    val frameAnalysis = visionEngine.analyzeImage(Uri.fromFile(frameFile))
+                    "Video keyframe [${sec / 60}m:${sec % 60}s]: ${frameAnalysis.sceneDescription}"
                 } else {
-                    "Video marker at ${sec}s"
+                    "No frame could be extracted at ${sec}s."
                 }
 
                 val combinedContent = buildString {
@@ -199,7 +200,7 @@ class MediaIngestor(
         val docId = documentDao.insertDocument(docEntity)
 
         try {
-            onProgress(0.6f, "Running Qwen3-VL visual analysis and local OCR...")
+            onProgress(0.6f, "Checking local image-understanding runtime...")
             val analysis = visionEngine.analyzeImage(uri)
             val sceneDescription = "Qwen3-VL Visual Asset '$fileName' [${analysis.width}x${analysis.height}, ${analysis.format}]: ${analysis.sceneDescription}"
             val vector = LocalEmbeddingEngine.generateEmbedding(sceneDescription)
