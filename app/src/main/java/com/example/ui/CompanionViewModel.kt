@@ -27,6 +27,7 @@ import com.example.database.entities.ConversationEntity
 import com.example.database.entities.DocumentEntity
 import com.example.database.entities.MemoryEntity
 import com.example.database.entities.MessageEntity
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -133,6 +134,7 @@ class CompanionViewModel(application: Application) : AndroidViewModel(applicatio
     val pdfAssistantLoading: StateFlow<Boolean> = _pdfAssistantLoading.asStateFlow()
 
     private var activeInferenceJob: Job? = null
+    private var activeIngestionJob: Job? = null
 
     init {
         viewModelScope.launch {
@@ -349,7 +351,9 @@ class CompanionViewModel(application: Application) : AndroidViewModel(applicatio
 
     // --- File Ingestion ---
     fun ingestFile(uri: Uri, fileName: String, fileType: FileType) {
-        viewModelScope.launch {
+        // Prevent overlapping imports from racing over the shared progress state.
+        if (_ingestionState.value.isIngesting) return
+        activeIngestionJob = viewModelScope.launch {
             _ingestionState.value = IngestionProgressState(
                 isIngesting = true,
                 progress = 0.05f,
@@ -393,6 +397,14 @@ class CompanionViewModel(application: Application) : AndroidViewModel(applicatio
                         fileName = fileName
                     )
                 }
+            } catch (cancelled: CancellationException) {
+                _ingestionState.value = IngestionProgressState(
+                    isIngesting = false,
+                    progress = 0f,
+                    statusText = "Cancelled",
+                    fileName = fileName
+                )
+                throw cancelled
             } catch (error: Exception) {
                 _ingestionState.value = IngestionProgressState(
                     isIngesting = false,
@@ -400,13 +412,14 @@ class CompanionViewModel(application: Application) : AndroidViewModel(applicatio
                     statusText = "Import failed: " + (error.message ?: "Unknown error"),
                     fileName = fileName
                 )
+            } finally {
+                activeIngestionJob = null
             }
         }
     }
 
     fun cancelIngestion() {
-        documentIngestor.cancel()
-        _ingestionState.value = IngestionProgressState(isIngesting = false, statusText = "Cancelled")
+        activeIngestionJob?.cancel()
     }
 
     fun deleteDocument(id: Long) {
@@ -427,8 +440,8 @@ class CompanionViewModel(application: Application) : AndroidViewModel(applicatio
             if (cachedPath != null) {
                 val file = File(cachedPath)
                 if (file.exists() && document.fileType == FileType.PDF) {
-                    pdfHelper.openPdf(file)
-                    renderReaderPage(document.lastReadPage)
+                    val openedPages = withContext(Dispatchers.IO) { pdfHelper.openPdf(file) }
+                    if (openedPages > 0) renderReaderPage(document.lastReadPage)
                 }
             }
 
@@ -446,7 +459,9 @@ class CompanionViewModel(application: Application) : AndroidViewModel(applicatio
         viewModelScope.launch {
             documentDao.updateLastReadPage(doc.id, clampedPage)
             if (doc.fileType == FileType.PDF) {
-                val bitmap = pdfHelper.renderPage(clampedPage - 1, targetWidth = 1080)
+                val bitmap = withContext(Dispatchers.IO) {
+                    pdfHelper.renderPage(clampedPage - 1, targetWidth = 1080)
+                }
                 _readerPageBitmap.value = bitmap
             }
         }
