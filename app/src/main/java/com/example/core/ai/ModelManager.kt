@@ -147,7 +147,7 @@ class ModelManager(private val context: Context) {
                 },
                 // Parser accepted the GGUF header/metadata. This is not a full
                 // checksum verification of every tensor block.
-                integrityVerified = true
+                integrityVerified = isLoaded
             )
         }.sortedWith(
             compareByDescending<GGUFModelInfo> { it.id == DEFAULT_MODEL_ID }
@@ -234,7 +234,10 @@ class ModelManager(private val context: Context) {
 
     private fun refreshModelCatalogFlagsOnly() {
         _availableModels.value = _availableModels.value.map { model ->
-            model.copy(isLoaded = model.localFilePath == llamaBridge.currentModelPath && llamaBridge.isModelLoaded)
+            model.copy(
+                isLoaded = model.localFilePath == llamaBridge.currentModelPath && llamaBridge.isModelLoaded,
+                integrityVerified = model.localFilePath == llamaBridge.currentModelPath && llamaBridge.isModelLoaded
+            )
         }
     }
 
@@ -275,7 +278,7 @@ class ModelManager(private val context: Context) {
                 isPreinstalled = false,
                 modelRole = role,
                 compatibility = "Imported local model",
-                integrityVerified = true
+                integrityVerified = false
             )
 
         if (role == ModelRole.VISION_MULTIMODAL || role == ModelRole.VISION_PROJECTOR) {
